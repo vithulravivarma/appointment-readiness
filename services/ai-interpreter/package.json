@@ -1,0 +1,31 @@
+{
+  "name": "ai-interpreter",
+  "version": "0.1.0",
+  "description": "AI Interpreter for appointment readiness",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@ar/types": "*",
+    "@aws-sdk/client-sqs": "^3.490.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "openai": "^6.17.0",
+    "pg": "^8.11.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.5",
+    "@types/pg": "^8.10.9",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  }
+}

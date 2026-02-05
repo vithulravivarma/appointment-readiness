@@ -1,0 +1,22 @@
+{
+  "name": "appointment-readiness-monorepo",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "shared/*"
+  ],
+  "scripts": {
+    "dev:readiness": "npm run dev --workspace=services/readiness-engine",
+    "migrate": "ts-node scripts/migrate.ts",
+    "test": "jest",
+    "infra:up": "docker-compose up -d",
+    "infra:down": "docker-compose down",
+    "setup": "./scripts/setup-local.sh"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2"
+  }
+}
