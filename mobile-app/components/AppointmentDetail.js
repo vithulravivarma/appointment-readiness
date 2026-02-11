@@ -3,11 +3,13 @@ import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-nati
 import axios from 'axios';
 import { API_BASE_URL } from '../constants/Config';
 import { Link, Stack } from 'expo-router';
+import { useRouter } from 'expo-router';
 
 
 export default function AppointmentDetail({ appointmentId }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const router = useRouter();
 
   useEffect(() => {
     if (appointmentId) fetchDetails();
@@ -32,12 +34,14 @@ export default function AppointmentDetail({ appointmentId }) {
       {/* If testing, Stack might not exist, so we check for it or ignore it */}
       {Stack?.Screen && <Stack.Screen options={{ title: 'Readiness Details' }} />}
 
-      <Text style={styles.header}>Status: {data.summary.status}</Text>
+      {/* FIXED: Removed 'summary.' */}
+      <Text style={styles.header}>Status: {data.status}</Text> 
       
       <Text style={styles.sectionTitle}>Checklist</Text>
       
       <ScrollView>
-        {data.checklist.map((item, index) => (
+        {/* FIXED: Changed 'checklist' to 'checks' */}
+        {data.checks.map((item, index) => (
           <View key={index} style={styles.checkItem}>
             <Text style={styles.checkTitle}>{item.check_type}</Text>
             <View style={[
@@ -50,11 +54,19 @@ export default function AppointmentDetail({ appointmentId }) {
         ))}
       </ScrollView>
       <View style={styles.footer}>
-        <Link href={`/chat/${appointmentId}`} asChild>
-          <TouchableOpacity style={styles.chatButton}>
-            <Text style={styles.chatButtonText}>Message Coordinator</Text>
-          </TouchableOpacity>
-        </Link>
+        <TouchableOpacity 
+          style={styles.chatButton}
+          onPress={() => {
+            router.push({
+              pathname: `/chat/${appointmentId}`,
+              // Pass the hardcoded COORDINATOR role since this screen 
+              // is specifically meant for the Coordinator/Scheduler
+              params: { role: 'COORDINATOR', userId: '00000000-0000-0000-0000-000000000004' } 
+            });
+          }}
+        >
+          <Text style={styles.chatButtonText}>Enter Chat Room</Text>
+        </TouchableOpacity>
       </View>
     </View>
   );

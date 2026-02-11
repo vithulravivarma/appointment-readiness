@@ -16,98 +16,110 @@ DO $$ BEGIN
     CREATE TYPE timesheet_status AS ENUM ('DRAFT', 'SUBMITTED', 'APPROVED', 'REJECTED');
 EXCEPTION WHEN duplicate_object THEN null; END $$;
 
--- 2. CAREGIVERS [cite: 105]
+DO $$ BEGIN
+    -- NEW: Standardized Sender Types for Chat
+    CREATE TYPE sender_type_enum AS ENUM ('FAMILY', 'CAREGIVER', 'SYSTEM', 'AI_AGENT', 'COORDINATOR');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+
+-- 2. CAREGIVERS
 CREATE TABLE IF NOT EXISTS caregivers (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    aloha_caregiver_id VARCHAR(255) UNIQUE NOT NULL,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- Keep UUIDs consistent
+    aloha_caregiver_id VARCHAR(255) UNIQUE,         -- Optional if not syncing with external system yet
     name VARCHAR(255) NOT NULL,
-    phone VARCHAR(50) NOT NULL, -- Needed for SMS
+    phone VARCHAR(50),
     email VARCHAR(255),
-    home_address TEXT,          -- [cite: 108]
-    home_coordinates POINT,     -- For Route Service [cite: 206]
+    home_address TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 3. CLIENTS (New - Critical for Family Notifications)
+-- 3. CLIENTS
 CREATE TABLE IF NOT EXISTS clients (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    aloha_client_id VARCHAR(255) UNIQUE NOT NULL,
+    aloha_client_id VARCHAR(255) UNIQUE,
     name VARCHAR(255) NOT NULL,
-    primary_phone VARCHAR(50) NOT NULL, -- The destination for family SMS 
-    service_address TEXT,               -- The default appointment location
-    service_coordinates POINT,          -- For Route Service
+    primary_phone VARCHAR(50),
+    service_address TEXT,               -- ADDED: We needed this for the Seed Script error!
+    service_coordinates POINT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 4. APPOINTMENTS [cite: 67]
+-- 4. APPOINTMENTS
 CREATE TABLE IF NOT EXISTS appointments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    aloha_appointment_id VARCHAR(255) UNIQUE NOT NULL,
-    client_id UUID REFERENCES clients(id),         -- 
-    caregiver_id UUID REFERENCES caregivers(id),   -- [cite: 71]
-    start_time TIMESTAMP WITH TIME ZONE NOT NULL,  -- [cite: 72]
+    aloha_appointment_id VARCHAR(255) UNIQUE,
+    client_id UUID REFERENCES clients(id),
+    caregiver_id UUID REFERENCES caregivers(id),
+    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
     end_time TIMESTAMP WITH TIME ZONE NOT NULL,
     service_type VARCHAR(100),
-    location_address TEXT,                         -- [cite: 73]
-    location_coordinates POINT,                    -- For Route Service
-    aloha_status VARCHAR(50),                      -- [cite: 74]
+    location_address TEXT,
+    aloha_status VARCHAR(50) DEFAULT 'SCHEDULED',
+    -- Linking to Readiness Status directly on the appointment is helpful for fast queries
+    readiness_status readiness_status DEFAULT 'NOT_STARTED', 
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 5. APPOINTMENT_READINESS [cite: 75]
-CREATE TABLE IF NOT EXISTS appointment_readiness (
-    appointment_id UUID PRIMARY KEY REFERENCES appointments(id) ON DELETE CASCADE,
-    status readiness_status DEFAULT 'NOT_STARTED', -- [cite: 78]
-    risk_score INTEGER DEFAULT 0,                  -- [cite: 79]
-    last_evaluated_at TIMESTAMP WITH TIME ZONE,    -- [cite: 80]
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- 6. READINESS_CHECKS [cite: 81]
+-- 5. READINESS_CHECKS (The Checklist)
 CREATE TABLE IF NOT EXISTS readiness_checks (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     appointment_id UUID REFERENCES appointments(id) ON DELETE CASCADE,
-    check_type VARCHAR(50) NOT NULL, -- [cite: 85]
+    check_type VARCHAR(50) NOT NULL, 
     status check_status DEFAULT 'PENDING',
-    source VARCHAR(50) DEFAULT 'SYSTEM', -- [cite: 87]
+    source VARCHAR(50) DEFAULT 'SYSTEM',
     details JSONB DEFAULT '{}',
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(appointment_id, check_type)
 );
 
--- 7. MESSAGES [cite: 96]
-CREATE TABLE IF NOT EXISTS messages (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    appointment_id UUID REFERENCES appointments(id),
-    channel VARCHAR(50) DEFAULT 'SMS',    -- [cite: 100]
-    direction VARCHAR(20) NOT NULL,       -- [cite: 101]
-    sender_role VARCHAR(50),              -- 'FAMILY', 'CAREGIVER', 'SYSTEM'
-    raw_content TEXT,                     -- [cite: 102]
-    interpreted_signals JSONB,            -- [cite: 103] (AI Output)
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- 8. READINESS_EVENTS [cite: 89] (Audit Log)
+-- 6. READINESS_EVENTS (Audit Log)
 CREATE TABLE IF NOT EXISTS readiness_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     appointment_id UUID REFERENCES appointments(id),
-    event_type VARCHAR(100) NOT NULL,     -- [cite: 93]
-    details JSONB,                        -- [cite: 94]
+    event_type VARCHAR(100) NOT NULL,
+    details JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 9. TIMESHEETS  (Restored)
+-- 7. MESSAGES (UPDATED for Chat App & AI)
+CREATE TABLE IF NOT EXISTS messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    appointment_id UUID REFERENCES appointments(id),
+    content TEXT NOT NULL,
+    sender_type sender_type_enum NOT NULL,
+    sender_id VARCHAR(255) NOT NULL,
+    is_agent BOOLEAN DEFAULT FALSE,
+    channel VARCHAR(50) DEFAULT 'APP',
+    interpreted_signals JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ADD THIS LINE HERE:
+CREATE INDEX IF NOT EXISTS idx_messages_appt ON messages(appointment_id);
+
+-- 8. TIMESHEETS
 CREATE TABLE IF NOT EXISTS timesheets (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    appointment_id UUID REFERENCES appointments(id), -- [cite: 113]
-    caregiver_id UUID REFERENCES caregivers(id),     -- [cite: 114]
-    hours_worked NUMERIC(5, 2),                      -- [cite: 115]
-    status timesheet_status DEFAULT 'DRAFT',         -- [cite: 116]
-    submitted_at TIMESTAMP WITH TIME ZONE,           -- [cite: 117]
-    approved_at TIMESTAMP WITH TIME ZONE,            -- [cite: 118]
+    appointment_id UUID REFERENCES appointments(id),
+    caregiver_id UUID REFERENCES caregivers(id),
+    hours_worked NUMERIC(5, 2),
+    status timesheet_status DEFAULT 'DRAFT',
+    submitted_at TIMESTAMP WITH TIME ZONE,
+    approved_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 9. USER AGENTS (NEW - The Digital Twins)
+-- This stores the settings for the AI "Shadow" of each human.
+CREATE TABLE IF NOT EXISTS user_agents (
+    user_id VARCHAR(255) PRIMARY KEY, -- Links to caregiver_id or client_id
+    role sender_type_enum NOT NULL,   -- 'CAREGIVER' or 'FAMILY'
+    status VARCHAR(20) DEFAULT 'ACTIVE', -- 'ACTIVE' or 'PAUSED'
+    paused_until TIMESTAMP WITH TIME ZONE,
+    persona_settings JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );

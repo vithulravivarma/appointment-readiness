@@ -1,3 +1,4 @@
+// services/readiness-engine/src/repository.ts
 import { Pool } from 'pg';
 
 export interface ReadinessState {
@@ -12,7 +13,6 @@ export interface ReadinessState {
 
 // 1. Ensure standard checks exist for this appointment
 export async function ensureChecklistExists(pool: Pool, appointmentId: string): Promise<void> {
-  // In the future, you can make this dynamic based on Service Type (e.g. only some need Meds)
   const defaultChecks = ['ACCESS_CODE', 'SAFETY_ASSESSMENT', 'CAREGIVER_CONFIRMATION'];
   
   const client = await pool.connect();
@@ -21,8 +21,8 @@ export async function ensureChecklistExists(pool: Pool, appointmentId: string): 
     
     for (const check of defaultChecks) {
       await client.query(`
-        INSERT INTO readiness_checks (appointment_id, check_type, status)
-        VALUES ($1, $2, 'PENDING')
+        INSERT INTO readiness_checks (appointment_id, check_type, status, updated_at)
+        VALUES ($1, $2, 'PENDING', NOW())
         ON CONFLICT (appointment_id, check_type) DO NOTHING
       `, [appointmentId, check]);
     }
@@ -38,15 +38,20 @@ export async function ensureChecklistExists(pool: Pool, appointmentId: string): 
 
 // 2. Fetch the full state (Readiness + Checks)
 export async function getReadinessState(pool: Pool, appointmentId: string): Promise<ReadinessState> {
+  // FIXED: Query the 'appointments' table instead of 'appointment_readiness'
   const res = await pool.query(`
     SELECT 
-      ar.status, 
-      ar.risk_score,
-      json_agg(json_build_object('type', rc.check_type, 'status', rc.status)) as checks
-    FROM appointment_readiness ar
-    LEFT JOIN readiness_checks rc ON ar.appointment_id = rc.appointment_id
-    WHERE ar.appointment_id = $1
-    GROUP BY ar.appointment_id
+      a.readiness_status as status, 
+      0 as risk_score, -- Hardcoded to 0 since we removed this column to simplify
+      COALESCE(
+        json_agg(json_build_object('type', rc.check_type, 'status', rc.status)) 
+        FILTER (WHERE rc.check_type IS NOT NULL), 
+        '[]'
+      ) as checks
+    FROM appointments a
+    LEFT JOIN readiness_checks rc ON a.id = rc.appointment_id
+    WHERE a.id = $1
+    GROUP BY a.id, a.readiness_status
   `, [appointmentId]);
 
   if (res.rows.length === 0) {
@@ -55,22 +60,23 @@ export async function getReadinessState(pool: Pool, appointmentId: string): Prom
 
   return {
     appointmentId,
-    status: res.rows[0].status,
+    status: res.rows[0].status || 'NOT_STARTED',
     riskScore: res.rows[0].risk_score,
-    checks: res.rows[0].checks || []
+    checks: res.rows[0].checks
   };
 }
 
 // 3. Update the overall status
 export async function updateReadinessStatus(pool: Pool, appointmentId: string, status: string, score: number): Promise<void> {
+  // FIXED: Update the 'appointments' table directly
   await pool.query(`
-    UPDATE appointment_readiness
-    SET status = $2, risk_score = $3, last_evaluated_at = NOW()
-    WHERE appointment_id = $1
-  `, [appointmentId, status, score]);
+    UPDATE appointments
+    SET readiness_status = $2
+    WHERE id = $1
+  `, [appointmentId, status]);
 }
 
-// 4. Update a specific check (e.g. mark MEDICATION as PASS)
+// 4. Update a specific check (e.g. mark ACCESS_CODE as PASS)
 export async function updateCheckStatus(pool: Pool, appointmentId: string, checkType: string, status: string): Promise<void> {
   await pool.query(`
     UPDATE readiness_checks

@@ -17,9 +17,13 @@ services:
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # 👇 THIS IS THE MAGIC LINE YOU WERE MISSING 👇
+      # Update the left side path to wherever you actually saved schema.sql
+      - ./migrations/schema.sql:/docker-entrypoint-initdb.d/init.sql
 
   localstack:
     image: localstack/localstack:latest
+    # ... rest of localstack config (unchanged) ...
     container_name: appointment-readiness-localstack
     environment:
       - SERVICES=sqs,s3

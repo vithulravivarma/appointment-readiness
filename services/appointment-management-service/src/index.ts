@@ -1,9 +1,14 @@
-import { Request, Response } from 'express';
+// services/appointment-management-service/src/index.ts
+import express, { Express, Request, Response } from 'express';
+import cors from 'cors';
 import { loadConfig } from './config';
 import { initializeDatabase, testConnection } from './db';
-import { createServer } from './server';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 
+// --- 1. SETUP & CONFIG ---
+const config = loadConfig();
+// FORCE PORT 3001 (To match your Frontend error URL)
+const PORT = process.env.PORT || 3001; 
 
 const sqs = new SQSClient({
   region: 'us-east-1',
@@ -12,111 +17,166 @@ const sqs = new SQSClient({
 });
 
 async function main() {
-  console.log('[STARTUP] Starting appointment-management-service...');
-  const config = loadConfig();
+  console.log('[STARTUP] 🚀 Initializing Service...');
 
-  // 1. Connect to Real DB
+  // --- 2. DATABASE ---
   const pool = initializeDatabase(config.database);
   await testConnection(pool);
 
-  const app = createServer();
+  // --- 3. SERVER & CORS (THE FIX) ---
+  const app = express();
 
-  // --- REAL ENDPOINTS ---
+  // A. The Package
+  app.use(cors());
+
+  // B. The Manual Override (Nuclear Option)
+  app.use((req, res, next) => {
+    console.log(`[REQUEST] ${req.method} ${req.url}`); // Log every hit!
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    next();
+  });
+
+  app.use(express.json());
+
+  // --- 4. ROUTES ---
+
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok', port: PORT });
+  });
 
   // GET /appointments
-  // Returns real appointments joined with their readiness status
   app.get('/appointments', async (req: Request, res: Response) => {
     try {
+      // 1. Extract the generic userId and role
+      const { userId, role, caregiverId } = req.query;
+      
+      // Fallback just in case the frontend still sends caregiverId
+      const targetId = userId || caregiverId; 
+
+      if (!targetId && role !== 'COORDINATOR') {
+        return res.status(400).json({ error: 'Missing userId' });
+      }
+
+      console.log(`[API] Fetching appointments for: ${targetId} (Role: ${role})`);
+
+      // 2. DYNAMIC FILTERING LOGIC
+      let userFilter = '';
+      let queryParams: any[] = [];
+
+      if (role === 'FAMILY' || role === 'PATIENT') {
+        userFilter = 'WHERE a.client_id = $1';
+        queryParams = [targetId];
+      } else if (role === 'COORDINATOR') {
+        userFilter = ''; // Coordinators see ALL appointments
+        queryParams = [];
+      } else {
+        // Default to Caregiver
+        userFilter = 'WHERE a.caregiver_id = $1';
+        queryParams = [targetId];
+      }
+
+      // 3. EXECUTE THE QUERY
       const result = await pool.query(`
         SELECT 
           a.id, 
           a.aloha_appointment_id,
           a.start_time,
+          a.end_time,
           a.service_type,
+          a.readiness_status,
           c.name as client_name,
-          ar.status as readiness_status,
-          ar.risk_score
+          c.service_address,
+          c.primary_phone
         FROM appointments a
         LEFT JOIN clients c ON a.client_id = c.id
-        LEFT JOIN appointment_readiness ar ON a.id = ar.appointment_id
+        ${userFilter}
         ORDER BY a.start_time ASC
-      `);
+      `, queryParams);
       
-      res.json({ data: result.rows });
+      console.log(`[API] Found ${result.rows.length} records.`);
+      res.json(result.rows);
+
     } catch (error) {
-      console.error('Failed to fetch appointments', error);
+      console.error('[API ERROR]', error);
       res.status(500).json({ error: 'Internal Server Error' });
     }
   });
 
   // GET /appointments/:id/readiness
-  // Returns the specific checklist for one appointment
   app.get('/appointments/:id/readiness', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
       
-      // Fetch checks
+      // 1. Get the High-Level Status directly from the 'appointments' table
+      const summaryRes = await pool.query(`
+        SELECT readiness_status 
+        FROM appointments 
+        WHERE id = $1
+      `, [id]);
+
+      if (summaryRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+
+      // 2. Get the specific checklist items
       const checksRes = await pool.query(`
-        SELECT check_type, status, details 
+        SELECT check_type, status, updated_at 
         FROM readiness_checks 
         WHERE appointment_id = $1
       `, [id]);
 
-      // Fetch summary
-      const summaryRes = await pool.query(`
-        SELECT status, risk_score 
-        FROM appointment_readiness 
-        WHERE appointment_id = $1
-      `, [id]);
-
-      if (summaryRes.rows.length === 0) {
-        res.status(404).json({ error: 'Appointment not found' });
-        return;
-      }
+      const summary = summaryRes.rows[0];
 
       res.json({
         appointmentId: id,
-        summary: summaryRes.rows[0],
-        checklist: checksRes.rows
+        status: summary.readiness_status || 'NOT_STARTED',
+        riskScore: 0, // Hardcoded to 0 for now to keep the UI happy
+        checks: checksRes.rows
       });
     } catch (error) {
-      console.error('Failed to fetch readiness details', error);
+      console.error('Failed to fetch readiness:', error);
       res.status(500).json({ error: 'Internal Server Error' });
     }
   });
 
+  // POST /messages
   app.post('/messages', async (req: Request, res: Response) => {
     try {
-      const { appointmentId, content } = req.body;
-      
-      // SECURITY: We force the type to CAREGIVER because this API is for the App.
-      const senderType = 'CAREGIVER';
-      const senderId = 'CG-DEMO-USER'; // In real life, this comes from the auth token
+      const { appointmentId, content, senderType, senderId } = req.body;
+      const finalSenderType = senderType || 'CAREGIVER';
+      const finalSenderId = senderId || 'CG-DEMO-USER';
 
-      // A. Save to Database (The Truth)
+      // Traffic Cop Logic
+      if (finalSenderType !== 'SYSTEM' && finalSenderType !== 'AI_AGENT') {
+        await pool.query(`
+          INSERT INTO user_agents (user_id, role, status, paused_until)
+          VALUES ($1, $2, 'PAUSED', NOW() + INTERVAL '30 minutes')
+          ON CONFLICT (user_id) DO UPDATE SET status = 'PAUSED', paused_until = NOW() + INTERVAL '30 minutes'
+        `, [finalSenderId, finalSenderType]);
+      }
+
       const dbResult = await pool.query(`
-        INSERT INTO messages (appointment_id, sender_type, sender_id, content)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
+        VALUES ($1, $2, $3, $4, false)
         RETURNING id, created_at
-      `, [appointmentId, senderType, senderId, content]);
+      `, [appointmentId, finalSenderType, finalSenderId, content]);
 
       const newMessage = dbResult.rows[0];
 
-      // B. Push to Queue (The Brain)
-      // We explicitly tell the AI: "A CAREGIVER sent this."
       await sqs.send(new SendMessageCommand({
         QueueUrl: 'http://localhost:4566/000000000000/incoming-messages-queue',
         MessageBody: JSON.stringify({
           type: 'NEW_MESSAGE',
           appointmentId,
           text: content,
-          senderType, // <--- Context for the AI
-          senderId,
+          senderType: finalSenderType,
+          senderId: finalSenderId,
           messageId: newMessage.id
         })
       }));
 
-      console.log(`[CHAT] Processed message: ${content}`);
       res.json({ success: true, data: newMessage });
     } catch (error) {
       console.error('Failed to send message', error);
@@ -125,59 +185,62 @@ async function main() {
   });
 
   // GET /appointments/:id/messages
-  // Returns history
   app.get('/appointments/:id/messages', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
       const result = await pool.query(`
-        SELECT * FROM messages 
-        WHERE appointment_id = $1 
-        ORDER BY created_at ASC
+        SELECT * FROM messages WHERE appointment_id = $1 ORDER BY created_at ASC
       `, [id]);
-      
       res.json({ data: result.rows });
     } catch (error) {
-      console.error('Failed to fetch messages', error);
       res.status(500).json({ error: 'Internal Server Error' });
     }
   });
 
-  app.get('/appointments/:id/readiness', async (req, res) => {
-  const { id } = req.params;
-  
-  try {
-    // 1. Get the High-Level Status (Green/Red)
-    const readinessResult = await pool.query(`
-      SELECT status, risk_score, last_evaluated_at 
-      FROM appointment_readiness 
-      WHERE appointment_id = $1
-    `, [id]);
+  // GET /agents/:userId/status
+  // Fetches the current status of a user's digital twin
+  app.get('/agents/:userId/status', async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params;
+      const result = await pool.query(
+        `SELECT status FROM user_agents WHERE user_id = $1`, 
+        [userId]
+      );
+      
+      const status = result.rows[0]?.status || 'ACTIVE'; // Default to active
+      res.json({ status });
+    } catch (error) {
+      console.error('Failed to fetch agent status', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
 
-    // Default to 'PENDING' if the engine hasn't run yet
-    const summary = readinessResult.rows[0] || { status: 'PENDING', risk_score: 0 };
+  // PUT /agents/:userId/status
+  // Manually overrides the AI status (ON/OFF)
+  app.put('/agents/:userId/status', async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params;
+      const { status } = req.body; // 'ACTIVE' or 'PAUSED'
 
-    // 2. Get the Specific Checklist (The "Why")
-    const checksResult = await pool.query(`
-      SELECT check_type, status, updated_at 
-      FROM readiness_checks 
-      WHERE appointment_id = $1
-    `, [id]);
+      await pool.query(`
+        INSERT INTO user_agents (user_id, role, status, paused_until)
+        VALUES ($1, 'CAREGIVER', $2, NULL)
+        ON CONFLICT (user_id) 
+        DO UPDATE SET status = $2, paused_until = NULL
+      `, [userId, status]);
 
-    res.json({
-      appointmentId: id,
-      status: summary.status,      // READY, BLOCKED, PRE_CHECK
-      riskScore: summary.risk_score,
-      checks: checksResult.rows    // Array of { check_type: 'ACCESS_CODE', status: 'PASS' }
-    });
+      res.json({ success: true, status });
+    } catch (error) {
+      console.error('Failed to update agent status', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
 
-  } catch (error) {
-    console.error('Failed to fetch readiness:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-
-  const server = app.listen(config.port, () => {
-    console.log(`✅ Appointment API (Real Data) running on port ${config.port}`);
+  // --- 5. START SERVER ---
+  app.listen(PORT, () => {
+    console.log(`\n✅ SERVICE IS LIVE ON PORT ${PORT}`);
+    console.log(`   👉 Test URL: http://localhost:${PORT}/health`);
+    console.log(`   👉 CORS is ENABLED for everyone.\n`);
   });
 }
 
