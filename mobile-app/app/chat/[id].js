@@ -1,229 +1,267 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList, KeyboardAvoidingView, Platform, Alert, Switch } from 'react-native';
-import { useLocalSearchParams, Stack } from 'expo-router';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList, KeyboardAvoidingView, Platform, Alert } from 'react-native';
+import { useLocalSearchParams, Stack, useRouter } from 'expo-router';
 import axios from 'axios';
 import { API_BASE_URL } from '../../constants/Config';
+import { DS, baseStyles } from '../../design/system';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 export default function ChatScreen() {
-  // 1. GET USER CONTEXT (Passed from Dashboard/AppointmentList)
-  // Default to 'CAREGIVER' if testing directly without the flow
-  const { id, role, userId } = useLocalSearchParams(); 
-  const currentRole = role || 'CAREGIVER'; 
+  const { id, role, userId, authToken } = useLocalSearchParams();
+  const currentRole = role || 'CAREGIVER';
   const currentUserId = userId || 'demo-user';
+  const router = useRouter();
 
   const [message, setMessage] = useState('');
   const [history, setHistory] = useState([]);
   const flatListRef = useRef(null);
 
-  // New State for the Toggle
-  const [agentStatus, setAgentStatus] = useState('ACTIVE');
-
-  // Fetch agent status on load
   useEffect(() => {
     fetchHistory();
-    fetchAgentStatus(); // <-- Add this
-    const interval = setInterval(fetchHistory, 3000); 
-    return () => clearInterval(interval);
-  }, [id]);
-
-  const fetchAgentStatus = async () => {
-    try {
-      const res = await axios.get(`${API_BASE_URL}/agents/${currentUserId}/status`);
-      setAgentStatus(res.data.status);
-    } catch (e) {
-      console.log("No agent status found, defaulting to ACTIVE");
-    }
-  };
-
-  const toggleAgent = async () => {
-    const newStatus = agentStatus === 'ACTIVE' ? 'PAUSED' : 'ACTIVE';
-    // Optimistic UI update
-    setAgentStatus(newStatus); 
-    try {
-      await axios.put(`${API_BASE_URL}/agents/${currentUserId}/status`, { status: newStatus });
-    } catch (error) {
-      console.error("Failed to toggle agent", error);
-      Alert.alert('Error', 'Could not update Digital Twin status.');
-      setAgentStatus(agentStatus); // Revert on failure
-    }
-  };
-
-  useEffect(() => {
-    fetchHistory();
-    const interval = setInterval(fetchHistory, 3000); 
+    const interval = setInterval(fetchHistory, 3000);
     return () => clearInterval(interval);
   }, [id]);
 
   const fetchHistory = async () => {
     try {
-      const res = await axios.get(`${API_BASE_URL}/appointments/${id}/messages`);
+      const res = await axios.get(`${API_BASE_URL}/appointments/${id}/messages`, {
+        params: { role: currentRole, userId: currentUserId },
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+      });
       setHistory(res.data.data);
     } catch (e) {
-      console.error("Fetch Error:", e);
+      console.error('Fetch Error:', e);
     }
   };
 
   const handleSend = async () => {
     if (!message.trim()) return;
-    
-    // 2. OPTIMISTIC UI UPDATE
-    // We use 'currentRole' so it appears on the right side immediately
-    const tempMsg = { 
-        id: Date.now().toString(), 
-        content: message, 
-        sender_type: currentRole, 
-        created_at: new Date().toISOString()
+
+    const tempMsg = {
+      id: Date.now().toString(),
+      content: message,
+      sender_type: currentRole,
+      created_at: new Date().toISOString(),
     };
-    
-    setHistory(prev => [...prev, tempMsg]);
+
+    setHistory((prev) => [...prev, tempMsg]);
     setMessage('');
-    
-    // Scroll to bottom
     setTimeout(() => flatListRef.current?.scrollToEnd(), 100);
 
     try {
-      // 3. SEND DYNAMIC IDENTITY TO SERVER
       await axios.post(`${API_BASE_URL}/messages`, {
         appointmentId: id,
         content: tempMsg.content,
-        senderType: currentRole,  // <--- CRITICAL CHANGE
-        senderId: currentUserId   // <--- CRITICAL CHANGE
+        senderType: currentRole,
+        senderId: currentUserId,
+      }, {
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
       });
-      
-      // Refresh to get the real ID/Timestamp from server
-      fetchHistory(); 
+      fetchHistory();
     } catch (error) {
       console.error(error);
       Alert.alert('Error', 'Failed to send message');
     }
   };
 
-  // Helper to decide bubble style
   const isMe = (msgSenderType) => msgSenderType === currentRole;
 
   return (
-    <KeyboardAvoidingView 
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'} 
-      style={styles.container}
-    >
-      {/* Dynamic Header Title */}
-      <Stack.Screen options={{ title: `Chat (${currentRole})` }} />
-      {/* 🤖 DIGITAL TWIN STATUS BAR */}
-      {currentRole !== 'COORDINATOR' && (
-        <View style={styles.agentBar}>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text style={{ fontSize: 20, marginRight: 8 }}>🤖</Text>
-            <View>
-              <Text style={styles.agentTitle}>Digital Twin</Text>
-              <Text style={[styles.agentSubtitle, { color: agentStatus === 'ACTIVE' ? '#34C759' : '#FF3B30' }]}>
-                {agentStatus === 'ACTIVE' ? 'Auto-replying' : 'Paused'}
+    <SafeAreaView style={styles.safeArea} edges={['left', 'right', 'bottom']}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
+        style={styles.container}
+      >
+        <Stack.Screen options={{ title: `Chat (${currentRole})` }} />
+
+        {currentRole === 'CAREGIVER' && (
+          <View style={styles.agentBar}>
+            <View style={{ flex: 1, paddingRight: DS.spacing.sm }}>
+              <Text style={styles.agentTitle}>Agent is managed from Agent Desk</Text>
+              <Text style={styles.agentSubtitle}>
+                Use free-form commands there or start structured delegations, then return for summaries.
               </Text>
             </View>
-          </View>
-          <Switch 
-            value={agentStatus === 'ACTIVE'} 
-            onValueChange={toggleAgent}
-            trackColor={{ false: '#D1D1D6', true: '#34C759' }}
-          />
-        </View>
-      )}
-
-
-      <FlatList
-        ref={flatListRef}
-        data={history}
-        keyExtractor={item => item.id.toString()}
-        contentContainerStyle={{ padding: 15, paddingBottom: 20 }}
-        onContentSizeChange={() => flatListRef.current?.scrollToEnd()}
-        renderItem={({ item }) => {
-          const amIMe = isMe(item.sender_type);
-          const isAI = item.sender_type === 'AI_AGENT';
-
-          return (
-            <View style={[
-              styles.bubble, 
-              amIMe ? styles.myBubble : styles.theirBubble,
-              isAI ? { backgroundColor: '#F3E5F5', borderColor: '#CE93D8', borderWidth: 1 } : null // Give AI a light purple look
-            ]}>
-              <Text style={[
-                styles.bubbleText, 
-                !amIMe && { color: '#000' },
-                isAI && { color: '#4A148C', fontStyle: 'italic' } // Purple italic text for AI
-              ]}>
-                {item.content}
-              </Text>
-              
-              {!amIMe && 
-                <Text style={styles.senderLabel}>
-                  {isAI ? '🤖 Digital Twin' : item.sender_type}
-                </Text>
+            <TouchableOpacity
+              style={styles.agentDeskBtn}
+              onPress={() =>
+                router.push({
+                  pathname: '/agent-command-center',
+                  params: { role: currentRole, userId: currentUserId, authToken },
+                })
               }
-            </View>
-          );
-        }}
-      />
+            >
+              <Text style={styles.agentDeskBtnText}>Open Desk</Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
-      <View style={styles.inputContainer}>
-        <TextInput
-          style={styles.input}
-          value={message}
-          onChangeText={setMessage}
-          placeholder={`Message as ${currentRole}...`}
-          placeholderTextColor="#999"
+        <FlatList
+          ref={flatListRef}
+          data={history}
+          keyExtractor={(item) => item.id.toString()}
+          contentContainerStyle={styles.listContent}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          onContentSizeChange={() => flatListRef.current?.scrollToEnd()}
+          renderItem={({ item }) => {
+            const amIMe = isMe(item.sender_type);
+            const isAI = item.sender_type === 'AI_AGENT';
+
+            return (
+              <View
+                style={[
+                  styles.bubble,
+                  amIMe ? styles.myBubble : styles.theirBubble,
+                  isAI && styles.aiBubble,
+                ]}
+              >
+                <Text style={[styles.bubbleText, !amIMe && styles.theirText, isAI && styles.aiText]}>
+                  {item.content}
+                </Text>
+
+                {!amIMe && (
+                  <Text style={styles.senderLabel}>
+                    {isAI ? 'Digital Twin' : item.sender_type}
+                  </Text>
+                )}
+              </View>
+            );
+          }}
         />
-        <TouchableOpacity onPress={handleSend}>
-          <Text style={styles.sendText}>Send</Text>
-        </TouchableOpacity>
-      </View>
-    </KeyboardAvoidingView>
+
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            value={message}
+            onChangeText={setMessage}
+            placeholder={`Message as ${currentRole}...`}
+            placeholderTextColor={DS.colors.textMuted}
+            returnKeyType="send"
+            onSubmitEditing={handleSend}
+          />
+          <TouchableOpacity onPress={handleSend} style={styles.sendButton}>
+            <Text style={styles.sendText}>Send</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f5f5f5' },
-  bubble: { padding: 12, borderRadius: 16, marginBottom: 10, maxWidth: '80%' },
+  safeArea: {
+    ...baseStyles.screen,
+  },
+  container: {
+    ...baseStyles.screen,
+  },
   agentBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    padding: 12,
+    backgroundColor: DS.colors.surface,
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    elevation: 2,
-    zIndex: 10,
-  },
-  agentTitle: { fontWeight: 'bold', fontSize: 14, color: '#333' },
-  agentSubtitle: { fontSize: 12, marginTop: 2 },
-  
-  // Blue bubble on right
-  myBubble: { backgroundColor: '#007AFF', alignSelf: 'flex-end', borderBottomRightRadius: 2 },
-  
-  // Grey bubble on left
-  theirBubble: { backgroundColor: '#E5E5EA', alignSelf: 'flex-start', borderBottomLeftRadius: 2 },
-  
-  bubbleText: { color: '#fff', fontSize: 16 },
-  senderLabel: { fontSize: 10, color: '#666', marginTop: 4, textTransform: 'capitalize' },
-  
-  inputContainer: { 
-    flexDirection: 'row', 
-    padding: 15, 
-    backgroundColor: '#fff', 
+    borderBottomColor: DS.colors.border,
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  agentTitle: {
+    color: DS.colors.textPrimary,
+    fontWeight: '700',
+    fontSize: DS.typography.caption,
+  },
+  agentSubtitle: {
+    marginTop: DS.spacing.xxs,
+    fontSize: DS.typography.micro,
+    color: DS.colors.textSecondary,
+  },
+  agentDeskBtn: {
+    backgroundColor: DS.colors.brand,
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: DS.spacing.xs,
+  },
+  agentDeskBtnText: {
+    color: DS.colors.surface,
+    fontWeight: '700',
+    fontSize: DS.typography.caption,
+  },
+  listContent: {
+    padding: DS.spacing.md,
+    paddingBottom: DS.spacing.lg,
+  },
+  bubble: {
+    padding: DS.spacing.sm,
+    borderRadius: DS.radius.md,
+    marginBottom: DS.spacing.sm,
+    maxWidth: '82%',
+  },
+  myBubble: {
+    backgroundColor: DS.colors.brand,
+    alignSelf: 'flex-end',
+    borderBottomRightRadius: 4,
+  },
+  theirBubble: {
+    backgroundColor: DS.colors.surface,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    alignSelf: 'flex-start',
+    borderBottomLeftRadius: 4,
+  },
+  aiBubble: {
+    backgroundColor: '#FFF4E7',
+    borderColor: '#F1C88D',
+  },
+  bubbleText: {
+    color: DS.colors.surface,
+    fontSize: DS.typography.body,
+  },
+  theirText: {
+    color: DS.colors.textPrimary,
+  },
+  aiText: {
+    color: '#8A4B00',
+    fontStyle: 'italic',
+  },
+  senderLabel: {
+    fontSize: DS.typography.micro,
+    color: DS.colors.textMuted,
+    marginTop: DS.spacing.xxs,
+    textTransform: 'capitalize',
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
     borderTopWidth: 1,
-    borderTopColor: '#eee'
+    borderTopColor: DS.colors.border,
+    backgroundColor: DS.colors.surface,
+    alignItems: 'center',
   },
-  input: { 
-    flex: 1, 
-    backgroundColor: '#f0f0f0', 
-    borderRadius: 20, 
-    paddingHorizontal: 15, 
-    paddingVertical: 10, 
-    marginRight: 10,
-    fontSize: 16
+  input: {
+    flex: 1,
+    backgroundColor: DS.colors.surfaceMuted,
+    borderRadius: DS.radius.pill,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 10,
+    marginRight: DS.spacing.xs,
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.body,
   },
-  sendText: { color: '#007AFF', fontWeight: 'bold', fontSize: 16 }
+  sendButton: {
+    height: 40,
+    borderRadius: DS.radius.pill,
+    backgroundColor: DS.colors.brand,
+    paddingHorizontal: DS.spacing.md,
+    justifyContent: 'center',
+  },
+  sendText: {
+    color: DS.colors.surface,
+    fontWeight: '700',
+    fontSize: DS.typography.caption,
+  },
 });

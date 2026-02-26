@@ -1,71 +1,172 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, useWindowDimensions } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import { DS, baseStyles } from '../design/system';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 export default function Dashboard() {
   const router = useRouter();
-  const params = useLocalSearchParams(); // Gets { role, name, userId } passed from index
+  const params = useLocalSearchParams();
+  const { width } = useWindowDimensions();
+  const compact = width < 390;
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.welcome}>Welcome, {params.name}</Text>
-      <Text style={styles.roleTag}>{params.role}</Text>
+    <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+      <ScrollView contentContainerStyle={styles.container}>
+        <View style={styles.headerPanel}>
+          <Text style={styles.welcome}>Welcome, {params.name}</Text>
+          <Text style={styles.roleTag}>{params.role}</Text>
+        </View>
 
-      <View style={styles.grid}>
-        {/* BOX 1: TIMESHEETS (Placeholder) */}
-        <TouchableOpacity style={styles.box} onPress={() => alert('Timesheets Feature Coming Soon')}>
-          <Ionicons name="time" size={40} color="#666" />
-          <Text style={styles.boxText}>Timesheets</Text>
-        </TouchableOpacity>
+        <View style={[styles.grid, compact && styles.gridCompact]}>
+          <TouchableOpacity style={[styles.box, compact && styles.boxCompact]} onPress={() => alert('Timesheets Feature Coming Soon')}>
+            <View style={[styles.iconBadge, { backgroundColor: '#E6EEF7' }]}>
+              <Ionicons name="time" size={28} color={DS.colors.info} />
+            </View>
+            <Text style={styles.boxTitle}>Timesheets</Text>
+            <Text style={styles.boxMeta}>Track hours and approvals</Text>
+          </TouchableOpacity>
 
-        {/* BOX 2: CHAT / APPOINTMENTS */}
-        <TouchableOpacity 
-          style={[styles.box, styles.activeBox]} 
-          onPress={() => {
-            // Navigate to the list, but pass the USER CONTEXT along
-            router.push({ 
-              pathname: '/appointment-list', 
-              params: { ...params } // Pass role/userId forward
-            });
-          }}
-        >
-          <Ionicons name="chatbubbles" size={40} color="#fff" />
-          <Text style={[styles.boxText, { color: '#fff' }]}>My Chats</Text>
-        </TouchableOpacity>
-      </View>
-    </View>
+          <TouchableOpacity
+            style={[styles.box, styles.activeBox, compact && styles.boxCompact]}
+            onPress={() => {
+              router.push({
+                pathname: '/appointment-list',
+                params: { ...params },
+              });
+            }}
+          >
+            <View style={[styles.iconBadge, styles.activeIconBadge]}>
+              <Ionicons name="chatbubbles" size={28} color={DS.colors.surface} />
+            </View>
+            <Text style={styles.activeBoxTitle}>My Chats</Text>
+            <Text style={styles.activeBoxMeta}>Live appointment communication</Text>
+          </TouchableOpacity>
+        </View>
+
+        {params.role === 'CAREGIVER' && (
+          <TouchableOpacity
+            style={styles.agentDeskButton}
+            onPress={() => {
+              router.push({
+                pathname: '/agent-command-center',
+                params: { ...params },
+              });
+            }}
+          >
+            <Text style={styles.agentDeskTitle}>Agent Desk</Text>
+            <Text style={styles.agentDeskMeta}>
+              Delegate conversations, assign goals, and review AI summaries when you return.
+            </Text>
+          </TouchableOpacity>
+        )}
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, backgroundColor: '#fff', paddingTop: 60 },
-  welcome: { fontSize: 24, fontWeight: 'bold' },
-  roleTag: { 
-    alignSelf: 'flex-start', 
-    backgroundColor: '#eee', 
-    paddingHorizontal: 10, 
-    paddingVertical: 4, 
-    borderRadius: 8, 
-    marginTop: 5, 
-    fontSize: 12, 
-    fontWeight: 'bold', 
-    color: '#555' 
+  safeArea: {
+    ...baseStyles.screen,
   },
-  grid: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 40 },
+  container: {
+    paddingHorizontal: DS.spacing.md,
+    paddingTop: DS.spacing.xl,
+    paddingBottom: DS.spacing.xl,
+  },
+  headerPanel: {
+    ...baseStyles.card,
+    padding: DS.spacing.md,
+    marginBottom: DS.spacing.lg,
+  },
+  welcome: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.title,
+    fontWeight: '800',
+    marginBottom: DS.spacing.xs,
+  },
+  roleTag: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#DFF3EF',
+    color: DS.colors.brandStrong,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 5,
+    borderRadius: DS.radius.pill,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  grid: {
+    flexDirection: 'row',
+    gap: DS.spacing.sm,
+    flexWrap: 'wrap',
+  },
+  gridCompact: {
+    flexDirection: 'column',
+  },
   box: {
-    width: '48%',
-    height: 150,
-    backgroundColor: '#f5f5f5',
-    borderRadius: 15,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#ddd'
+    ...baseStyles.card,
+    flex: 1,
+    minHeight: 190,
+    minWidth: 150,
+    padding: DS.spacing.md,
+    justifyContent: 'space-between',
+  },
+  boxCompact: {
+    minHeight: 160,
   },
   activeBox: {
-    backgroundColor: '#2196F3', // Blue for the active feature
-    borderColor: '#2196F3'
+    backgroundColor: DS.colors.brand,
+    borderColor: DS.colors.brand,
   },
-  boxText: { marginTop: 10, fontSize: 16, fontWeight: '600' }
+  iconBadge: {
+    width: 46,
+    height: 46,
+    borderRadius: DS.radius.sm,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  activeIconBadge: {
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
+  boxTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    marginTop: DS.spacing.md,
+  },
+  boxMeta: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+  },
+  activeBoxTitle: {
+    color: DS.colors.surface,
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    marginTop: DS.spacing.md,
+  },
+  activeBoxMeta: {
+    color: '#D8F2EE',
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+  },
+  agentDeskButton: {
+    ...baseStyles.card,
+    marginTop: DS.spacing.sm,
+    padding: DS.spacing.md,
+    backgroundColor: '#EAF4F2',
+    borderColor: '#B7D8D3',
+  },
+  agentDeskTitle: {
+    color: DS.colors.brandStrong,
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    marginBottom: DS.spacing.xxs,
+  },
+  agentDeskMeta: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+  },
 });

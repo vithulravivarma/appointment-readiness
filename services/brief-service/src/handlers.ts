@@ -1,5 +1,5 @@
 import { Message, SQSClient } from '@aws-sdk/client-sqs';
-import { BriefGenerationJob, NotificationJob } from '@ar/types';
+import { BriefGenerationJob, NotificationJob, QUEUES } from '@ar/types';
 import { subscribeToQueue, publishMessage } from './sqs';
 
 export async function handleBriefGeneration(message: Message, sqsClient: SQSClient): Promise<void> {
@@ -31,7 +31,7 @@ export async function handleBriefGeneration(message: Message, sqsClient: SQSClie
     };
 
     console.log('[BRIEF] 🚚 Sending brief to Notification Service...');
-    await publishMessage(sqsClient, 'notification-queue', notification);
+    await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
 
   } catch (error) {
     console.error('[BRIEF] Failed to generate brief', error);
@@ -39,7 +39,7 @@ export async function handleBriefGeneration(message: Message, sqsClient: SQSClie
 }
 
 export async function initializeConsumers(sqsClient: SQSClient): Promise<void> {
-  await subscribeToQueue(sqsClient, 'brief-generation-queue', (msg) => 
+  await subscribeToQueue(sqsClient, QUEUES.BRIEF_GENERATION, (msg) => 
     handleBriefGeneration(msg, sqsClient)
   );
 }

@@ -1,6 +1,6 @@
 import { Message } from '@aws-sdk/client-sqs';
 import { subscribeToQueue } from './sqs';
-import { NotificationJob } from '@ar/types'; // <--- Shared Type
+import { NotificationJob, QUEUES } from '@ar/types'; // <--- Shared Type
 
 export async function handleNotification(message: Message): Promise<void> {
   if (!message.Body) return;
@@ -23,5 +23,5 @@ export async function handleNotification(message: Message): Promise<void> {
 }
 
 export async function initializeConsumers(sqsClient: any): Promise<void> {
-  await subscribeToQueue(sqsClient, 'notification-queue', handleNotification);
+  await subscribeToQueue(sqsClient, QUEUES.NOTIFICATION, handleNotification);
 }

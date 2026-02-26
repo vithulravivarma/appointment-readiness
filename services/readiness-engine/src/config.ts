@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import path from 'path';
+import { SERVICE_PORTS } from '@ar/types';
 
 dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
 
@@ -18,7 +19,7 @@ export interface Config {
 }
 
 export function loadConfig(): Config {
-  const port = parseInt(process.env.PORT || '3001', 10);
+  const port = parseInt(process.env.PORT || String(SERVICE_PORTS.READINESS_ENGINE), 10);
   const databaseUrl = process.env.DATABASE_URL;
   
   // Database connection limit (Default to 5 if not set)

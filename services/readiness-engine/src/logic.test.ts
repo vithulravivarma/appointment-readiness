@@ -16,12 +16,12 @@ describe('Readiness Logic (The Brain)', () => {
     expect(result.shouldNotify).toBe(false);
   });
 
-  test('should escalate to BLOCKED if ANY check fails', () => {
+  test('should escalate to BLOCKED if a critical check fails', () => {
     const state = {
       ...baseState,
       checks: [
-        { type: 'MEDS', status: 'PASS' },
-        { type: 'ACCESS', status: 'FAIL' } // <--- CRITICAL FAILURE
+        { type: 'MEDS_SUPPLIES_READY', status: 'PASS' },
+        { type: 'ACCESS_CONFIRMED', status: 'FAIL' } // <--- CRITICAL FAILURE
       ]
     };
     
@@ -31,12 +31,27 @@ describe('Readiness Logic (The Brain)', () => {
     expect(result.shouldNotify).toBe(true);
   });
 
+  test('should mark AT_RISK when only non-critical checks fail', () => {
+    const state = {
+      ...baseState,
+      checks: [
+        { type: 'ACCESS_CONFIRMED', status: 'PASS' },
+        { type: 'VISIT_BRIEF_READY', status: 'FAIL' },
+      ],
+    };
+
+    const result = evaluateReadiness(state);
+    expect(result.nextStatus).toBe('AT_RISK');
+    expect(result.riskScore).toBe(75);
+    expect(result.shouldNotify).toBe(true);
+  });
+
   test('should mark READY only when ALL checks pass', () => {
     const state = {
       ...baseState,
       checks: [
-        { type: 'MEDS', status: 'PASS' },
-        { type: 'ACCESS', status: 'PASS' }
+        { type: 'MEDS_SUPPLIES_READY', status: 'PASS' },
+        { type: 'ACCESS_CONFIRMED', status: 'PASS' }
       ]
     };
 
@@ -49,8 +64,8 @@ describe('Readiness Logic (The Brain)', () => {
     const state = {
       ...baseState,
       checks: [
-        { type: 'MEDS', status: 'PASS' },
-        { type: 'ACCESS', status: 'PENDING' }
+        { type: 'MEDS_SUPPLIES_READY', status: 'PASS' },
+        { type: 'ACCESS_CONFIRMED', status: 'PENDING' }
       ]
     };
 

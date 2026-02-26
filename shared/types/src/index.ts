@@ -1,4 +1,6 @@
 // --- Core Entities ---
+export * from './platform';
+export * from './precheck';
 
 export type ReadinessStatus = 'NOT_STARTED' | 'IN_PROGRESS' | 'READY' | 'AT_RISK' | 'BLOCKED';
 
@@ -22,7 +24,7 @@ export interface Appointment {
 export interface ReadinessEvaluationEvent {
   messageId: string;
   appointmentId: string;
-  trigger: 'INGESTION' | 'UPDATE' | 'MANUAL';
+  trigger: 'INGESTION' | 'UPDATE' | 'MANUAL' | 'LIFECYCLE';
   timestamp: string;
   payload?: Partial<Appointment>; // Optional context to save DB lookups
 }
@@ -37,8 +39,8 @@ export interface NotificationJob {
   correlationId?: string;
 }
 
-// 3. Notification Service -> AI Interpreter
-// Queue: message-interpretation-queue
+// 3. Appointment API -> AI Interpreter
+// Queue: incoming-messages-queue
 export interface InboundMessageEvent {
   rawContent: string;
   sender: string;
@@ -47,7 +49,7 @@ export interface InboundMessageEvent {
 }
 
 // 4. AI Interpreter -> Readiness Engine
-// Queue: readiness-signals-queue
+// Queue: readiness-updates-queue
 export interface AIInterpretationSignal {
   originalMessageId: string;
   intent: 'CONFIRMATION' | 'CANCELLATION' | 'ISSUE' | 'UNKNOWN';

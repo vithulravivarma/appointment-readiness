@@ -1,50 +1,62 @@
-# Welcome to your Expo app 👋
+# Mobile App Demo Guide
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+## Prerequisites
+- Node 20+
+- Xcode (for iOS simulator) and/or Android Studio (for Android emulator)
+- Backend services running locally (`appointment-management-service` on port `3001`)
 
-## Get started
-
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
+## Install
 ```bash
-npm run reset-project
+cd mobile-app
+npm install
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## API Configuration
+`mobile-app/constants/Config.js` now supports emulator-safe defaults and env overrides.
 
-## Learn more
+Optional env vars (set before launching Expo):
+```bash
+EXPO_PUBLIC_API_BASE_URL=http://10.0.2.2:3001
+EXPO_PUBLIC_ANDROID_API_BASE_URL=http://10.0.2.2:3001
+EXPO_PUBLIC_IOS_API_BASE_URL=http://localhost:3001
+EXPO_PUBLIC_API_PORT=3001
+EXPO_PUBLIC_PROD_API_BASE_URL=https://api.aloha-readiness.com
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+Recommended defaults:
+- Android emulator: `http://10.0.2.2:3001`
+- iOS simulator: `http://localhost:3001`
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Run On Emulator
+From `mobile-app/`:
+```bash
+npm run android
+```
+or
+```bash
+npm run ios
+```
 
-## Join the community
+If you prefer Metro UI:
+```bash
+npm start
+```
+Then press `a` (Android) or `i` (iOS).
 
-Join our community of developers creating universal apps.
+## Demo Checklist
+1. Ingest data first (`POST /ingest/excel`) so login accounts exist.
+2. Open app and sign in with an ingested account (`demo123`).
+3. Verify these screens on emulator:
+   - Login
+   - Dashboard
+   - Appointment list
+   - Chat
+   - Agent Desk
+4. In chat, confirm keyboard + input bar behavior on small screens.
+5. In appointment list, confirm filter controls wrap correctly on narrow devices.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## Troubleshooting
+- `Network Error` on Android emulator: ensure API URL uses `10.0.2.2`, not `localhost`.
+- `Network Error` on iOS simulator: ensure API URL uses `localhost`.
+- Empty login accounts: run ingestion and check `GET /auth/accounts`.
+- If backend port differs, set `EXPO_PUBLIC_API_PORT` or `EXPO_PUBLIC_API_BASE_URL`.

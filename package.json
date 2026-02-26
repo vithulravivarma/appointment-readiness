@@ -9,6 +9,7 @@
     "dev:readiness": "npm run dev --workspace=services/readiness-engine",
     "migrate": "ts-node scripts/migrate.ts",
     "test": "jest",
+    "smoke": "./scripts/e2e-smoke.sh",
     "infra:up": "docker-compose up -d",
     "infra:down": "docker-compose down",
     "setup": "./scripts/setup-local.sh"

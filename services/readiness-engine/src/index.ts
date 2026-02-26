@@ -21,16 +21,17 @@ async function main() {
     // Step 1: Load configuration
     console.log('[STARTUP] Step 1: Loading configuration...');
     context.config = loadConfig();
+    const config = context.config;
     console.log('[STARTUP] ✓ Configuration loaded successfully', {
-      port: context.config.port,
-      databaseUrl: context.config.database.url ? 'configured' : 'missing',
-      sqsEndpoint: context.config.sqs.endpoint || 'AWS default',
-      sqsRegion: context.config.sqs.region,
+      port: config.port,
+      databaseUrl: config.database.url ? 'configured' : 'missing',
+      sqsEndpoint: config.sqs.endpoint || 'AWS default',
+      sqsRegion: config.sqs.region,
     });
 
     // Step 2: Connect to Postgres
     console.log('[STARTUP] Step 2: Connecting to PostgreSQL...');
-    context.pool = initializeDatabase(context.config.database);
+    context.pool = initializeDatabase(config.database);
     const dbConnected = await testConnection(context.pool);
     if (!dbConnected) {
       throw new Error('Database connection test failed');
@@ -40,23 +41,24 @@ async function main() {
     // Step 3: Start Express server
     console.log('[STARTUP] Step 3: Starting Express server...');
     const app = createServer();
-    context.server = app.listen(context.config.port);
+    const server = app.listen(config.port);
+    context.server = server;
     await new Promise<void>((resolve, reject) => {
-      context.server.on('listening', () => {
+      server.on('listening', () => {
         console.log('[STARTUP] ✓ Express server started successfully', {
-          port: context.config.port,
-          healthEndpoint: `http://localhost:${context.config.port}/health`,
+          port: config.port,
+          healthEndpoint: `http://localhost:${config.port}/health`,
         });
         resolve();
       });
-      context.server.on('error', (error: Error) => {
+      server.on('error', (error: Error) => {
         reject(error);
       });
     });
 
     // Step 4: Initialize SQS consumers
     console.log('[STARTUP] Step 4: Initializing SQS consumers...');
-    context.sqsClient = initializeSQS(context.config.sqs);
+    context.sqsClient = initializeSQS(config.sqs);
     
     // PASS THE POOL HERE vvv
     await initializeConsumers(context.sqsClient, context.pool!); 
@@ -69,9 +71,10 @@ async function main() {
     const shutdown = async (signal: string) => {
       console.log(`[SHUTDOWN] Received ${signal}, shutting down gracefully...`);
 
-      if (context.server) {
+      const serverRef = context.server;
+      if (serverRef) {
         await new Promise<void>((resolve) => {
-          context.server.close(() => {
+          serverRef.close(() => {
             console.log('[SHUTDOWN] ✓ HTTP server closed');
             resolve();
           });

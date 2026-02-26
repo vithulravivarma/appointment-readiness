@@ -34,10 +34,8 @@ describe('Readiness Repository (Integration)', () => {
 
     const internalId = aptRes.rows[0].id;
 
-    // 4. Create Readiness Record
-    await pool.query(`
-      INSERT INTO appointment_readiness (appointment_id, status) VALUES ($1, 'NOT_STARTED')
-    `, [internalId]);
+    // 4. No readiness seed row required.
+    // Readiness status is stored directly on appointments.readiness_status.
   });
 
   afterAll(async () => {
@@ -58,7 +56,7 @@ describe('Readiness Repository (Integration)', () => {
     // 4. Verify
     expect(state.appointmentId).toBe(internalId);
     expect(state.status).toBe('NOT_STARTED');
-    expect(state.checks.length).toBeGreaterThan(0); // Should have default checks like ACCESS_CODE
+    expect(state.checks.length).toBeGreaterThan(0); // Should have default checks like ACCESS_CONFIRMED
     expect(state.checks[0].status).toBe('PENDING');
   });
 });

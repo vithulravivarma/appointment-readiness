@@ -123,3 +123,18 @@ CREATE TABLE IF NOT EXISTS user_agents (
     persona_settings JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- 10. AUTH USERS (DEV LOGIN)
+CREATE TABLE IF NOT EXISTS auth_users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    username VARCHAR(120) UNIQUE NOT NULL,
+    password_plaintext VARCHAR(120) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('CAREGIVER', 'FAMILY')),
+    person_id UUID NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(role, person_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users(role);

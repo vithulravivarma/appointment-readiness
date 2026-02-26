@@ -13,8 +13,8 @@ QUEUES=(
   "readiness-evaluation-queue"
   "notification-queue"
   "brief-generation-queue"
-  "message-interpretation-queue"
-  "readiness-signals-queue"
+  "incoming-messages-queue"
+  "readiness-updates-queue"
   "timesheets-queue"
 )
 

@@ -16,9 +16,12 @@ async function main() {
     
     // 2. AWS SQS Setup
     const sqs = new SQSClient({
-      region: 'us-east-1',
-      endpoint: process.env.SQS_ENDPOINT || 'http://localhost:4566',
-      credentials: { accessKeyId: 'test', secretAccessKey: 'test' }
+      region: config.sqs.region,
+      endpoint: config.sqs.endpoint,
+      credentials: {
+        accessKeyId: config.sqs.accessKeyId,
+        secretAccessKey: config.sqs.secretAccessKey,
+      }
     });
 
     // 3. Start Consumers (The Logic)
@@ -27,8 +30,8 @@ async function main() {
     // 4. (Optional) Simple Health Check Server
     const app = express();
     app.get('/health', (req, res) => res.send('OK'));
-    app.listen(config.port || 3002, () => {
-      console.log(`[STARTUP] ✓ Health Server running on port ${config.port || 3002}`);
+    app.listen(config.port, () => {
+      console.log(`[STARTUP] ✓ Health Server running on port ${config.port}`);
     });
 
     console.log('[STARTUP] ✓ Service fully operational');

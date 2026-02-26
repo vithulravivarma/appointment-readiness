@@ -1,4 +1,5 @@
 import { ReadinessState } from './repository';
+import { CHECKLIST_DEFINITIONS } from './repository';
 
 export interface EvaluationResult {
   nextStatus: string;
@@ -19,13 +20,27 @@ export function evaluateReadiness(state: ReadinessState): EvaluationResult {
 
   const passedChecks = state.checks.filter(c => c.status === 'PASS').length;
   const failedChecks = state.checks.filter(c => c.status === 'FAIL').length;
+  const pendingChecks = state.checks.filter(c => c.status === 'PENDING').length;
 
-  // RULE 1: Any Failure -> BLOCKED
-  if (failedChecks > 0) {
+  const criticalSet = new Set(CHECKLIST_DEFINITIONS.filter((c) => c.critical).map((c) => c.key));
+  const criticalFailed = state.checks.some((c) => criticalSet.has(String(c.type)) && c.status === 'FAIL');
+  const criticalPending = state.checks.filter((c) => criticalSet.has(String(c.type)) && c.status === 'PENDING').length;
+
+  // RULE 1: Any critical failure -> BLOCKED
+  if (criticalFailed) {
     return { 
       nextStatus: 'BLOCKED', 
       riskScore: 100, 
       shouldNotify: true // Escalation needed!
+    };
+  }
+
+  // RULE 1b: Non-critical failures still keep appointment at risk
+  if (failedChecks > 0) {
+    return {
+      nextStatus: 'AT_RISK',
+      riskScore: 75,
+      shouldNotify: true,
     };
   }
 
@@ -39,10 +54,17 @@ export function evaluateReadiness(state: ReadinessState): EvaluationResult {
   }
 
   // RULE 3: Some PENDING -> IN_PROGRESS or AT_RISK
-  // (Simple logic for now: Default to IN_PROGRESS)
+  if (criticalPending > 0) {
+    return {
+      nextStatus: 'IN_PROGRESS',
+      riskScore: 60,
+      shouldNotify: false,
+    };
+  }
+
   return { 
     nextStatus: 'IN_PROGRESS', 
-    riskScore: 50, 
+    riskScore: pendingChecks > 0 ? 40 : 25,
     shouldNotify: false 
   };
 }
