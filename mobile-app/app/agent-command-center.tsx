@@ -73,6 +73,15 @@ type AgentCommandResponse = {
   };
 };
 
+type AgentDeskHistoryRow = {
+  id: string;
+  actorType: 'CAREGIVER' | 'ASSISTANT' | 'SYSTEM';
+  content: string;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+  source?: string;
+};
+
 export default function AgentCommandCenter() {
   const params = useLocalSearchParams();
   const userId = String(params.userId || '00000000-0000-0000-0000-000000000002');
@@ -86,6 +95,7 @@ export default function AgentCommandCenter() {
   const [clientFilter, setClientFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [appointmentId, setAppointmentId] = useState('');
+  const [showLaterAppointments, setShowLaterAppointments] = useState(false);
 
   const [objective, setObjective] = useState('Collect logistics updates and keep client informed of ETA.');
   const [questionInput, setQuestionInput] = useState('Any access code changes?, Any pet/safety notes?');
@@ -155,6 +165,11 @@ export default function AgentCommandCenter() {
     });
   }, [sortedAppointments, clientFilter, dateFilter]);
 
+  const { operationalAppointments, laterAppointments } = useMemo(
+    () => splitAppointmentsByOperationalWindow(filteredAppointments),
+    [filteredAppointments],
+  );
+
   const filteredActiveDelegations = useMemo(() => {
     return activeDelegations.filter((item) => {
       const byClient = clientFilter ? item.clientName === clientFilter : true;
@@ -177,18 +192,25 @@ export default function AgentCommandCenter() {
   );
 
   useEffect(() => {
-    if (!filteredAppointments.length) {
+    const selectionPool = operationalAppointments.length > 0 ? operationalAppointments : filteredAppointments;
+    if (!selectionPool.length) {
       setAppointmentId('');
       return;
     }
 
-    if (!filteredAppointments.some((item) => item.id === appointmentId)) {
-      setAppointmentId(filteredAppointments[0].id);
+    if (!selectionPool.some((item) => item.id === appointmentId)) {
+      setAppointmentId(selectionPool[0].id);
     }
-  }, [filteredAppointments, appointmentId]);
+  }, [operationalAppointments, filteredAppointments, appointmentId]);
+
+  useEffect(() => {
+    if (dateFilter) {
+      setShowLaterAppointments(true);
+    }
+  }, [dateFilter]);
 
   const loadAll = async () => {
-    await Promise.all([loadAppointments(), loadDelegations(), loadSummaries(), loadCheckDefinitions()]);
+    await Promise.all([loadAppointments(), loadDelegations(), loadSummaries(), loadCheckDefinitions(), loadAgentDeskHistory()]);
   };
 
   const loadAppointments = async () => {
@@ -230,6 +252,29 @@ export default function AgentCommandCenter() {
     } catch (error) {
       console.error('Failed to load readiness check definitions', error);
       setCheckDefinitions([]);
+    }
+  };
+
+  const loadAgentDeskHistory = async () => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/agents/${userId}/chat/history`, {
+        params: { limit: 120 },
+        headers: authHeaders,
+      });
+      const rows: AgentDeskHistoryRow[] = Array.isArray(res.data?.data) ? res.data.data : [];
+      const mapped: CommandHistoryItem[] = rows
+        .slice()
+        .reverse()
+        .map((row) => ({
+          id: String(row.id || `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`),
+          actor: String(row.actorType || '').toUpperCase() === 'CAREGIVER' ? 'CAREGIVER' : 'AGENT',
+          text: String(row.content || ''),
+          mode: undefined,
+        }))
+        .filter((row) => row.text.length > 0);
+      setCommandHistory(mapped.slice(-120));
+    } catch (error) {
+      console.error('Failed to load agent desk history', error);
     }
   };
 
@@ -308,6 +353,8 @@ export default function AgentCommandCenter() {
 
       if (data.action?.type === 'START_DELEGATION' || data.mode === 'DELEGATION_STARTED') {
         await loadAll();
+      } else {
+        await loadAgentDeskHistory();
       }
     } catch (error: any) {
       const status = error?.response?.status;
@@ -559,7 +606,11 @@ export default function AgentCommandCenter() {
           </View>
 
           <Text style={styles.label}>Choose Visit</Text>
-          {filteredAppointments.map((item) => {
+          <View style={styles.groupHeaderRow}>
+            <Text style={styles.groupTitle}>Current & Soon</Text>
+            <Text style={styles.groupMeta}>Operational window</Text>
+          </View>
+          {operationalAppointments.map((item) => {
             const selected = item.id === appointmentId;
             return (
               <TouchableOpacity
@@ -576,6 +627,35 @@ export default function AgentCommandCenter() {
               </TouchableOpacity>
             );
           })}
+          {operationalAppointments.length === 0 ? <Text style={styles.emptyText}>No visits in the operational window.</Text> : null}
+
+          {laterAppointments.length > 0 ? (
+            <View style={styles.groupHeaderRow}>
+              <Text style={styles.groupTitle}>Later Appointments</Text>
+              <TouchableOpacity style={styles.groupToggleBtn} onPress={() => setShowLaterAppointments((prev) => !prev)}>
+                <Text style={styles.groupToggleBtnText}>{showLaterAppointments ? 'Hide' : `Show (${laterAppointments.length})`}</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
+          {showLaterAppointments
+            ? laterAppointments.map((item) => {
+                const selected = item.id === appointmentId;
+                return (
+                  <TouchableOpacity
+                    key={`later-${item.id}`}
+                    onPress={() => setAppointmentId(item.id)}
+                    style={[styles.appointmentRow, selected && styles.appointmentRowSelected]}
+                  >
+                    <Text style={[styles.appointmentRowTitle, selected && styles.appointmentRowTitleSelected]}>
+                      {item.client_name} • {formatDateTime(item.start_time)}
+                    </Text>
+                    <Text style={[styles.appointmentRowMeta, selected && styles.appointmentRowMetaSelected]}>
+                      {item.service_type || 'Service'}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })
+            : null}
           {filteredAppointments.length === 0 ? <Text style={styles.emptyText}>No visits for these filters.</Text> : null}
 
           <View style={styles.checklistSection}>
@@ -865,6 +945,34 @@ function buildCalendarCells(monthDate: Date): Array<Date | null> {
   return cells;
 }
 
+function splitAppointmentsByOperationalWindow(appointments: AppointmentRow[]): {
+  operationalAppointments: AppointmentRow[];
+  laterAppointments: AppointmentRow[];
+} {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 8).getTime();
+
+  const operationalAppointments: AppointmentRow[] = [];
+  const laterAppointments: AppointmentRow[] = [];
+
+  for (const item of appointments) {
+    const startTimeMs = new Date(item.start_time || '').getTime();
+    if (!Number.isFinite(startTimeMs)) {
+      laterAppointments.push(item);
+      continue;
+    }
+
+    if (startTimeMs >= start && startTimeMs < end) {
+      operationalAppointments.push(item);
+    } else {
+      laterAppointments.push(item);
+    }
+  }
+
+  return { operationalAppointments, laterAppointments };
+}
+
 function statusTone(status: 'PENDING' | 'PASS' | 'FAIL') {
   if (status === 'PASS') return styles.statusPass;
   if (status === 'FAIL') return styles.statusFail;
@@ -930,6 +1038,36 @@ const styles = StyleSheet.create({
   },
   clearFilterText: {
     color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  groupHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: DS.spacing.sm,
+    marginBottom: DS.spacing.xs,
+  },
+  groupTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '800',
+  },
+  groupMeta: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    fontWeight: '700',
+  },
+  groupToggleBtn: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 6,
+  },
+  groupToggleBtnText: {
+    color: DS.colors.info,
     fontSize: DS.typography.caption,
     fontWeight: '700',
   },

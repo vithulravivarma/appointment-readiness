@@ -16,6 +16,9 @@ export interface Config {
     accessKeyId: string;
     secretAccessKey: string;
   };
+  assistant: {
+    delegationCompletionNotifyV1: boolean;
+  };
 }
 
 export function loadConfig(): Config {
@@ -29,6 +32,11 @@ export function loadConfig(): Config {
   const sqsRegion = process.env.AWS_REGION || 'us-east-1';
   const sqsAccessKeyId = process.env.AWS_ACCESS_KEY_ID || 'test';
   const sqsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || 'test';
+  const delegationCompletionNotifyV1Raw = String(process.env.ASSISTANT_DELEGATION_COMPLETION_NOTIFY_V1 || 'true').toLowerCase();
+  const delegationCompletionNotifyV1 =
+    delegationCompletionNotifyV1Raw === '1' ||
+    delegationCompletionNotifyV1Raw === 'true' ||
+    delegationCompletionNotifyV1Raw === 'yes';
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
@@ -45,6 +53,9 @@ export function loadConfig(): Config {
       region: sqsRegion,
       accessKeyId: sqsAccessKeyId,
       secretAccessKey: sqsSecretAccessKey,
+    },
+    assistant: {
+      delegationCompletionNotifyV1,
     },
   };
 }

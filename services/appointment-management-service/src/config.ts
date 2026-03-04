@@ -23,6 +23,13 @@ export interface Config {
     apiKey: string;
     model: string;
   };
+  assistant: {
+    singleRouterV1: boolean;
+    enableLegacyRecoveryV0: boolean;
+    aiFirstIntentV1: boolean;
+    agentDeskPersistenceV1: boolean;
+    delegationContextCompilerV1: boolean;
+  };
 }
 
 export function loadConfig(): Config {
@@ -39,6 +46,21 @@ export function loadConfig(): Config {
   const googleMapsApiKey = String(process.env.GOOGLE_MAPS_API_KEY || '').trim();
   const openaiApiKey = String(process.env.OPENAI_API_KEY || '').trim();
   const openaiModel = String(process.env.AGENT_ASSISTANT_MODEL || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+  const singleRouterV1Raw = String(process.env.ASSISTANT_SINGLE_ROUTER_V1 || 'true').toLowerCase();
+  const enableLegacyRecoveryV0Raw = String(process.env.ASSISTANT_ENABLE_LEGACY_RECOVERY_V0 || 'false').toLowerCase();
+  const aiFirstIntentV1Raw = String(process.env.ASSISTANT_AI_FIRST_INTENT_V1 || 'true').toLowerCase();
+  const agentDeskPersistenceV1Raw = String(process.env.ASSISTANT_AGENT_DESK_PERSISTENCE_V1 || 'true').toLowerCase();
+  const delegationContextCompilerV1Raw = String(process.env.ASSISTANT_DELEGATION_CONTEXT_COMPILER_V1 || 'true').toLowerCase();
+  const singleRouterV1 = singleRouterV1Raw === '1' || singleRouterV1Raw === 'true' || singleRouterV1Raw === 'yes';
+  const enableLegacyRecoveryV0 =
+    enableLegacyRecoveryV0Raw === '1' || enableLegacyRecoveryV0Raw === 'true' || enableLegacyRecoveryV0Raw === 'yes';
+  const aiFirstIntentV1 = aiFirstIntentV1Raw === '1' || aiFirstIntentV1Raw === 'true' || aiFirstIntentV1Raw === 'yes';
+  const agentDeskPersistenceV1 =
+    agentDeskPersistenceV1Raw === '1' || agentDeskPersistenceV1Raw === 'true' || agentDeskPersistenceV1Raw === 'yes';
+  const delegationContextCompilerV1 =
+    delegationContextCompilerV1Raw === '1' ||
+    delegationContextCompilerV1Raw === 'true' ||
+    delegationContextCompilerV1Raw === 'yes';
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
@@ -62,6 +84,13 @@ export function loadConfig(): Config {
     openai: {
       apiKey: openaiApiKey,
       model: openaiModel,
+    },
+    assistant: {
+      singleRouterV1,
+      enableLegacyRecoveryV0,
+      aiFirstIntentV1,
+      agentDeskPersistenceV1,
+      delegationContextCompilerV1,
     },
   };
 }

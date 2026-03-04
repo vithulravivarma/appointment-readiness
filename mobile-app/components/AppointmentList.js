@@ -19,6 +19,7 @@ const API_URL = `${API_BASE_URL}/appointments`;
 export default function AppointmentList({ role, userId, authToken }) {
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [showLaterAppointments, setShowLaterAppointments] = useState(false);
 
   const [clientFilter, setClientFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
@@ -66,6 +67,17 @@ export default function AppointmentList({ role, userId, authToken }) {
     });
   }, [sortedAppointments, clientFilter, dateFilter]);
 
+  const { operationalAppointments, laterAppointments } = useMemo(
+    () => splitAppointmentsByOperationalWindow(filteredAppointments),
+    [filteredAppointments],
+  );
+
+  useEffect(() => {
+    if (dateFilter) {
+      setShowLaterAppointments(true);
+    }
+  }, [dateFilter]);
+
   const fetchAppointments = async () => {
     try {
       setLoading(true);
@@ -101,11 +113,71 @@ export default function AppointmentList({ role, userId, authToken }) {
 
   const isChatUser = role === 'CAREGIVER' || role === 'FAMILY';
 
+  const renderAppointmentCard = (item) => (
+    <TouchableOpacity
+      key={item.id}
+      style={styles.card}
+      onPress={() => {
+        if (isChatUser) {
+          router.push({
+            pathname: `/chat/${item.id}`,
+            params: {
+              role,
+              userId,
+              authToken,
+              clientName: item.client_name,
+              appointmentStartTime: item.start_time,
+              contextSource: 'selected_appointment',
+            },
+          });
+          return;
+        }
+
+        router.push({
+          pathname: `/appointment/${item.id}`,
+          params: { role, userId, authToken },
+        });
+      }}
+    >
+      <View style={styles.cardHeader}>
+        <View style={styles.headlineWrap}>
+          <Text style={styles.title}>{item.client_name}</Text>
+          <Text style={styles.subtitle}>{item.service_type || 'Home Health Visit'}</Text>
+          <Text style={styles.metaText}>{formatApptDateTime(item.start_time)}</Text>
+        </View>
+
+        <View style={[styles.iconBadge, isChatUser ? styles.chatBadge : styles.opsBadge]}>
+          <Ionicons
+            name={isChatUser ? 'chatbubble-ellipses' : 'clipboard'}
+            size={20}
+            color={isChatUser ? DS.colors.info : DS.colors.accent}
+          />
+        </View>
+      </View>
+
+      <View style={styles.cardFooter}>
+        <Text style={styles.datePill}>{formatDateOnly(item.start_time)}</Text>
+        {isChatUser ? (
+          <Text style={styles.cta}>Open thread</Text>
+        ) : (
+          <Text
+            style={[
+              styles.status,
+              item.readiness_status === 'READY' ? styles.ready : styles.atRisk,
+            ]}
+          >
+            {item.readiness_status}
+          </Text>
+        )}
+      </View>
+    </TouchableOpacity>
+  );
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.contentContainer}>
         <Text style={styles.pageTitle}>{isChatUser ? 'Your Conversations' : 'Operations Board'}</Text>
-        <Text style={styles.pageSubtitle}>Sorted by most recent visit first for quick scanning.</Text>
+        <Text style={styles.pageSubtitle}>Current and soon visits are shown first. Future visits are collapsed by default.</Text>
 
         <View style={styles.filterBar}>
           <TouchableOpacity style={styles.filterPill} onPress={() => setClientModalOpen(true)}>
@@ -123,58 +195,22 @@ export default function AppointmentList({ role, userId, authToken }) {
           </TouchableOpacity>
         </View>
 
-        {filteredAppointments.map((item) => (
-          <TouchableOpacity
-            key={item.id}
-            style={styles.card}
-            onPress={() => {
-              if (isChatUser) {
-                router.push({
-                  pathname: `/chat/${item.id}`,
-                  params: { role, userId, authToken },
-                });
-                return;
-              }
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Current & Soon</Text>
+          <Text style={styles.sectionMeta}>Operational window: yesterday through next 7 days</Text>
+        </View>
+        {operationalAppointments.map(renderAppointmentCard)}
+        {operationalAppointments.length === 0 ? <Text style={styles.empty}>No visits in the operational window.</Text> : null}
 
-              router.push({
-                pathname: `/appointment/${item.id}`,
-                params: { role, userId, authToken },
-              });
-            }}
-          >
-            <View style={styles.cardHeader}>
-              <View style={styles.headlineWrap}>
-                <Text style={styles.title}>{item.client_name}</Text>
-                <Text style={styles.subtitle}>{item.service_type || 'Home Health Visit'}</Text>
-                <Text style={styles.metaText}>{formatApptDateTime(item.start_time)}</Text>
-              </View>
-
-              <View style={[styles.iconBadge, isChatUser ? styles.chatBadge : styles.opsBadge]}>
-                <Ionicons
-                  name={isChatUser ? 'chatbubble-ellipses' : 'clipboard'}
-                  size={20}
-                  color={isChatUser ? DS.colors.info : DS.colors.accent}
-                />
-              </View>
-            </View>
-
-            <View style={styles.cardFooter}>
-              <Text style={styles.datePill}>{formatDateOnly(item.start_time)}</Text>
-              {isChatUser ? (
-                <Text style={styles.cta}>Open thread</Text>
-              ) : (
-                <Text
-                  style={[
-                    styles.status,
-                    item.readiness_status === 'READY' ? styles.ready : styles.atRisk,
-                  ]}
-                >
-                  {item.readiness_status}
-                </Text>
-              )}
-            </View>
-          </TouchableOpacity>
-        ))}
+        {laterAppointments.length > 0 ? (
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Later Appointments</Text>
+            <TouchableOpacity onPress={() => setShowLaterAppointments((prev) => !prev)} style={styles.toggleBtn}>
+              <Text style={styles.toggleBtnText}>{showLaterAppointments ? 'Hide' : `Show (${laterAppointments.length})`}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+        {showLaterAppointments ? laterAppointments.map(renderAppointmentCard) : null}
 
         {filteredAppointments.length === 0 ? <Text style={styles.empty}>No conversations for these filters.</Text> : null}
       </ScrollView>
@@ -352,6 +388,31 @@ function buildCalendarCells(monthDate) {
   return cells;
 }
 
+function splitAppointmentsByOperationalWindow(appointments) {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 8).getTime();
+
+  const operationalAppointments = [];
+  const laterAppointments = [];
+
+  for (const item of appointments) {
+    const startTimeMs = new Date(item.start_time || '').getTime();
+    if (!Number.isFinite(startTimeMs)) {
+      laterAppointments.push(item);
+      continue;
+    }
+
+    if (startTimeMs >= start && startTimeMs < end) {
+      operationalAppointments.push(item);
+    } else {
+      laterAppointments.push(item);
+    }
+  }
+
+  return { operationalAppointments, laterAppointments };
+}
+
 const styles = StyleSheet.create({
   container: {
     ...baseStyles.screen,
@@ -376,6 +437,36 @@ const styles = StyleSheet.create({
     fontSize: DS.typography.caption,
     marginTop: DS.spacing.xxs,
     marginBottom: DS.spacing.md,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: DS.spacing.sm,
+    marginBottom: DS.spacing.xs,
+  },
+  sectionTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '800',
+  },
+  sectionMeta: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    fontWeight: '600',
+  },
+  toggleBtn: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 6,
+    backgroundColor: DS.colors.surface,
+  },
+  toggleBtnText: {
+    color: DS.colors.info,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
   },
   filterBar: {
     flexDirection: 'row',

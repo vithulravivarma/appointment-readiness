@@ -13,6 +13,9 @@ Appointment readiness + caregiver delegation system with:
 - `services/brief-service` (port `3006`): brief generation queue consumer.
 - `mobile-app`: caregiver/family UI.
 
+Routing/intent flow details:
+- `docs/agent-routing-architecture.md`
+
 ### Precheck Profiles (Swappable Components)
 - Profile definitions live in `shared/types/src/precheck.ts`.
 - Current built-in profiles:
@@ -55,8 +58,13 @@ npm run migrate
 
 What this does:
 - Starts Postgres and LocalStack
-- Creates SQS queues used by services
+- Creates SQS queues + per-queue DLQs with redrive defaults (`scripts/setup-local.sh`)
 - Applies `migrations/schema.sql`
+
+For AWS environments, you can also bootstrap DLQ depth alarms:
+```bash
+DLQ_ALARM_SNS_TOPIC_ARN=<sns-topic-arn> ./scripts/setup-aws-dlq-alarms.sh
+```
 
 ## Start The System
 

@@ -88,6 +88,7 @@ curl -sS "${APPOINTMENT_API}/appointments/${APPOINTMENT_ID}/readiness" | jq '{st
 
 echo "==> [7/10] Starting delegation and forcing one AI handoff cycle"
 curl -sS -X POST "${APPOINTMENT_API}/agents/${CAREGIVER_USER_ID}/delegations/start" \
+  -H "Authorization: Bearer ${CAREGIVER_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "{\"appointmentId\":\"${APPOINTMENT_ID}\",\"objective\":\"Collect blockers and keep family informed.\",\"durationMinutes\":30,\"questions\":[\"Any access issues?\",\"Are medications and supplies ready?\"],\"forceStart\":true}" \
   | jq '.data.appointmentId, .data.active'
@@ -100,8 +101,10 @@ curl -sS -X POST "${APPOINTMENT_API}/messages" \
 sleep 2
 
 echo "==> [8/10] Ending delegation and validating summary history"
-curl -sS -X POST "${APPOINTMENT_API}/agents/${CAREGIVER_USER_ID}/delegations/${APPOINTMENT_ID}/stop" | jq '.data.summaryGeneratedAt'
-curl -sS "${APPOINTMENT_API}/agents/${CAREGIVER_USER_ID}/summaries" | jq '.data | length'
+curl -sS -X POST "${APPOINTMENT_API}/agents/${CAREGIVER_USER_ID}/delegations/${APPOINTMENT_ID}/stop" \
+  -H "Authorization: Bearer ${CAREGIVER_TOKEN}" | jq '.data.summaryGeneratedAt'
+curl -sS "${APPOINTMENT_API}/agents/${CAREGIVER_USER_ID}/summaries" \
+  -H "Authorization: Bearer ${CAREGIVER_TOKEN}" | jq '.data | length'
 
 echo "==> [9/10] Running simulated next-day ingestion"
 curl -sS -X POST "${INGESTION_API}/ingest/simulate/day" \

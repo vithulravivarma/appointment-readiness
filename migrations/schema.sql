@@ -138,3 +138,47 @@ CREATE TABLE IF NOT EXISTS auth_users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users(role);
+
+-- 11. MESSAGE IDEMPOTENCY (Queue consumer dedupe ledger)
+CREATE TABLE IF NOT EXISTS message_idempotency (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    consumer_name VARCHAR(160) NOT NULL,
+    queue_name VARCHAR(160) NOT NULL,
+    message_id VARCHAR(255) NOT NULL,
+    body_hash VARCHAR(64) NOT NULL,
+    processed_outcome VARCHAR(64) NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE(consumer_name, queue_name, message_id, body_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_idempotency_expires_at ON message_idempotency(expires_at);
+
+-- 12. AGENT DESK THREADS (Caregiver-scoped assistant workspace)
+CREATE TABLE IF NOT EXISTS agent_desk_threads (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    caregiver_id VARCHAR(255) NOT NULL UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 13. AGENT DESK MESSAGES (Persistent caregiver<->assistant command chat)
+CREATE TABLE IF NOT EXISTS agent_desk_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    thread_id UUID NOT NULL REFERENCES agent_desk_threads(id) ON DELETE CASCADE,
+    appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+    actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('CAREGIVER', 'ASSISTANT', 'SYSTEM')),
+    content TEXT NOT NULL,
+    source VARCHAR(80) NOT NULL DEFAULT 'AGENT_COMMAND',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    dedupe_key VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_desk_messages_thread_created_desc
+    ON agent_desk_messages(thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_desk_messages_appointment_created_desc
+    ON agent_desk_messages(appointment_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_desk_messages_dedupe_key
+    ON agent_desk_messages(dedupe_key)
+    WHERE dedupe_key IS NOT NULL;

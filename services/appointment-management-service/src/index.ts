@@ -6,6 +6,44 @@ import { loadConfig } from './config';
 import { initializeDatabase, testConnection } from './db';
 import { initializeSQS, publishMessage } from './sqs';
 import { QUEUES } from '@ar/types';
+import {
+  buildScheduleOverviewResponse as buildScheduleOverviewResponsePolicy,
+  clampAppointmentIdsByLimit,
+  formatBusinessDateLabel as formatBusinessDateLabelPolicy,
+  parseBusinessDateHint as parseBusinessDateHintPolicy,
+  resolveRequestedBusinessDate as resolveRequestedBusinessDatePolicy,
+} from './assistant-policy';
+import {
+  detectDeterministicTurnSignals,
+  type CaregiverTurnSignals,
+} from './turn-signal-policy';
+import {
+  getAgentSettingsVersion,
+  withAgentSettingsVersion,
+} from './agent-settings-policy';
+import {
+  shouldUseAiFirstIntent,
+  shouldUseLegacyPlannerRecovery,
+  shouldUsePlannerRepairHop,
+} from './router-policy';
+import { buildCaregiverDelegationSummary } from './delegation-summary-policy';
+import { hasDelegationIntent, hasExplicitDelegationDirective } from './delegation-intent-policy';
+import {
+  applyRouterContractDefaults,
+  normalizeRequiredSlots,
+  normalizeResponseStyle,
+  type RouterRequiredSlot,
+  type RouterResponseStyle,
+} from './router-contract-policy';
+import {
+  buildAgentDeskTurnDedupeKey,
+  compileDelegationContext,
+  inferDelegationTypeFromCommand,
+  type DelegationContextPacket,
+  type DelegationContextHistoryLine,
+  type DelegationQuestionItem,
+  type DelegationType,
+} from './delegation-context-compiler';
 
 // --- 1. SETUP & CONFIG ---
 const config = loadConfig();
@@ -16,7 +54,16 @@ type DelegationEntry = {
   active: boolean;
   objective: string;
   questions: string[];
+  questionItems?: DelegationQuestionItem[];
+  primaryQuestionIndexes?: number[];
+  optionalQuestionIndexes?: number[];
+  delegationType?: DelegationType;
+  factCheckClarificationAsked?: boolean;
   askedQuestionIndexes?: number[];
+  resolvedQuestionIndexes?: number[];
+  progressNotifiedIndexes?: number[];
+  completionNotifiedAt?: string;
+  contextPacket?: DelegationContextPacket;
   startedAt: string;
   endsAt: string;
   endedAt?: string;
@@ -34,10 +81,15 @@ type DelegationSummaryRecord = {
   summaryGeneratedAt: string;
 };
 
+type AgentPersonaSettingsMeta = {
+  version?: number;
+};
+
 type AgentPersonaSettings = {
   delegations?: Record<string, DelegationEntry>;
   summaryHistory?: DelegationSummaryRecord[];
   assistant?: AgentAssistantState;
+  _meta?: AgentPersonaSettingsMeta;
 };
 
 type CaregiverAppointmentRow = {
@@ -50,14 +102,6 @@ type CaregiverAppointmentRow = {
   appointmentStatus: string;
   locationAddress: string;
 };
-
-type AgentCommandIntent =
-  | 'START_DELEGATION'
-  | 'LOOKUP_ACCESS_CODE'
-  | 'MAPS_ROUTE'
-  | 'SCHEDULE_OVERVIEW'
-  | 'CLIENT_INFO_LOOKUP'
-  | 'UNKNOWN';
 
 type ClientMessageEvidenceRow = {
   appointmentId: string;
@@ -88,7 +132,10 @@ type StartDelegationInput = {
   objective: string;
   durationMinutes: number;
   questions: string[];
+  questionItems?: DelegationQuestionItem[];
+  delegationType?: DelegationType;
   forceStart?: boolean;
+  contextPacket?: DelegationContextPacket;
 };
 
 type StartDelegationResult =
@@ -123,10 +170,30 @@ type AssistantTurn = {
   role: 'CAREGIVER' | 'ASSISTANT';
   content: string;
   createdAt: string;
+  appointmentId?: string;
+};
+
+type AgentDeskActorType = 'CAREGIVER' | 'ASSISTANT' | 'SYSTEM';
+
+type AgentDeskMessageRow = {
+  id: string;
+  caregiverId: string;
+  threadId: string;
+  appointmentId?: string;
+  actorType: AgentDeskActorType;
+  content: string;
+  source: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
 };
 
 type AssistantPendingState = {
-  kind: 'MAPS_HOME_ADDRESS' | 'CLIENT_INFO_CONTEXT' | 'DELEGATION_CONTEXT';
+  kind:
+    | 'MAPS_HOME_ADDRESS'
+    | 'CLIENT_INFO_CONTEXT'
+    | 'DELEGATION_CONTEXT'
+    | 'DELEGATION_TARGET_CONTEXT'
+    | 'DELEGATION_CONTACT_CONFIRM';
   tool: 'MAPS_ROUTE' | 'CLIENT_INFO' | 'START_DELEGATION';
   baseCommand: string;
   requestedAppointmentId?: string;
@@ -147,6 +214,8 @@ type AgentAssistantState = {
 };
 
 type AssistantPlannerTool = 'SCHEDULE_DAY' | 'MAPS_ROUTE' | 'CLIENT_INFO' | 'START_DELEGATION';
+type AssistantRequiredSlot = RouterRequiredSlot;
+type AssistantResponseStyle = RouterResponseStyle;
 
 type AssistantPlannerDecision = {
   action: 'RESPOND' | 'ASK_FOLLOW_UP' | 'USE_TOOL';
@@ -158,6 +227,16 @@ type AssistantPlannerDecision = {
   objective?: string;
   questions?: string[];
   infoQuestion?: string;
+  requiredSlots?: AssistantRequiredSlot[];
+  responseStyle?: AssistantResponseStyle;
+};
+
+type MissingInfoPolicyAction = 'ANSWER_FROM_KNOWN_INFO' | 'ACQUIRE_MISSING_INFO';
+
+type MissingInfoPolicyDecision = {
+  action: MissingInfoPolicyAction;
+  confidence: number;
+  rationale: string;
 };
 
 type AuthRole = 'CAREGIVER' | 'FAMILY' | 'COORDINATOR';
@@ -168,6 +247,20 @@ type SessionUser = {
   displayName: string;
   username: string;
 };
+
+type AppointmentScopeRow = {
+  appointmentId: string;
+  caregiverId: string;
+  clientId: string;
+  startTime: string;
+};
+
+class SettingsVersionConflictError extends Error {
+  constructor(message: string = 'Agent settings version conflict') {
+    super(message);
+    this.name = 'SettingsVersionConflictError';
+  }
+}
 
 const APPOINTMENT_STATUSES = ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'] as const;
 
@@ -187,68 +280,6 @@ const CLIENT_LOOKUP_DEFAULT_APPOINTMENT_LIMIT = 20;
 const CLIENT_LOOKUP_DEFAULT_MESSAGE_LIMIT = 400;
 const CLIENT_LOOKUP_DEFAULT_SNIPPET_LIMIT = 4;
 const CLIENT_LOOKUP_LLM_CANDIDATE_LIMIT = 120;
-const LOOKUP_STOP_WORDS = new Set([
-  'the',
-  'a',
-  'an',
-  'and',
-  'or',
-  'to',
-  'of',
-  'for',
-  'in',
-  'on',
-  'at',
-  'by',
-  'with',
-  'is',
-  'are',
-  'was',
-  'were',
-  'be',
-  'been',
-  'being',
-  'do',
-  'does',
-  'did',
-  'can',
-  'could',
-  'would',
-  'should',
-  'has',
-  'have',
-  'had',
-  'i',
-  'me',
-  'my',
-  'we',
-  'our',
-  'you',
-  'your',
-  'they',
-  'them',
-  'their',
-  'again',
-  'what',
-  'when',
-  'where',
-  'who',
-  'which',
-  'tell',
-  'remind',
-  'give',
-  'about',
-  'patient',
-  'client',
-  'appointment',
-  'appointments',
-  'visit',
-  'visits',
-  'today',
-  'please',
-  'info',
-  'information',
-]);
 
 async function main() {
   console.log('[STARTUP] 🚀 Initializing Service...');
@@ -286,19 +317,82 @@ async function main() {
     return sessions.get(token) || null;
   }
 
-  async function getAgentSettings(userId: string): Promise<{ settings: AgentPersonaSettings; role: string }> {
+  async function loadAppointmentScope(appointmentId: string): Promise<AppointmentScopeRow | null> {
+    const result = await pool.query(
+      `
+        SELECT
+          id::text AS appointment_id,
+          caregiver_id::text AS caregiver_id,
+          client_id::text AS client_id,
+          start_time::text AS start_time
+        FROM appointments
+        WHERE id = $1::uuid
+        LIMIT 1
+      `,
+      [appointmentId],
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return {
+      appointmentId: String(row.appointment_id || ''),
+      caregiverId: String(row.caregiver_id || ''),
+      clientId: String(row.client_id || ''),
+      startTime: String(row.start_time || ''),
+    };
+  }
+
+  function canSessionAccessAppointment(sessionUser: SessionUser, scope: AppointmentScopeRow): boolean {
+    if (sessionUser.role === 'COORDINATOR') return true;
+    if (sessionUser.role === 'CAREGIVER') {
+      return sessionUser.userId === scope.caregiverId;
+    }
+    if (sessionUser.role === 'FAMILY') {
+      return sessionUser.userId === scope.clientId;
+    }
+    return false;
+  }
+
+  function senderTypeForSessionRole(role: AuthRole): 'CAREGIVER' | 'FAMILY' | 'COORDINATOR' {
+    if (role === 'FAMILY') return 'FAMILY';
+    if (role === 'COORDINATOR') return 'COORDINATOR';
+    return 'CAREGIVER';
+  }
+
+  function authorizeAgentUserAccess(req: Request, res: Response, requestedUserId: string): SessionUser | null {
+    const sessionUser = getSessionUser(req);
+    if (!sessionUser) {
+      res.status(401).json({ error: 'Authentication required' });
+      return null;
+    }
+    if (sessionUser.role === 'COORDINATOR') {
+      return sessionUser;
+    }
+    if (sessionUser.role !== 'CAREGIVER') {
+      res.status(403).json({ error: 'Only caregivers or coordinators can access agent endpoints' });
+      return null;
+    }
+    if (sessionUser.userId !== requestedUserId) {
+      res.status(403).json({ error: 'Caregivers can only access their own agent workspace' });
+      return null;
+    }
+    return sessionUser;
+  }
+
+  async function getAgentSettings(userId: string): Promise<{ settings: AgentPersonaSettings; role: string; version: number }> {
     const result = await pool.query(
       `SELECT role, persona_settings FROM user_agents WHERE user_id = $1`,
       [userId]
     );
 
     if (result.rows.length === 0) {
-      return { settings: {}, role: 'CAREGIVER' };
+      return { settings: {}, role: 'CAREGIVER', version: 0 };
     }
 
+    const settings = (result.rows[0].persona_settings || {}) as AgentPersonaSettings;
     return {
       role: result.rows[0].role || 'CAREGIVER',
-      settings: (result.rows[0].persona_settings || {}) as AgentPersonaSettings,
+      settings,
+      version: getAgentSettingsVersion(settings),
     };
   }
 
@@ -306,10 +400,34 @@ async function main() {
     userId: string,
     role: string,
     settings: AgentPersonaSettings,
-    options?: { activateAgent?: boolean }
-  ): Promise<void> {
+    options?: { activateAgent?: boolean; expectedVersion?: number }
+  ): Promise<number> {
     const activateAgent = Boolean(options?.activateAgent);
-    await pool.query(
+    const expectedVersionRaw = options?.expectedVersion;
+    const hasExpectedVersion = Number.isFinite(Number(expectedVersionRaw));
+    const expectedVersion = hasExpectedVersion
+      ? Math.max(0, Math.trunc(Number(expectedVersionRaw)))
+      : getAgentSettingsVersion(settings);
+    const nextVersion = expectedVersion + 1;
+    const versionedSettings = withAgentSettingsVersion(settings, nextVersion);
+
+    if (!hasExpectedVersion) {
+      await pool.query(
+        `
+          INSERT INTO user_agents (user_id, role, status, paused_until, persona_settings)
+          VALUES ($1, $2, 'ACTIVE', NULL, $3::jsonb)
+          ON CONFLICT (user_id)
+          DO UPDATE SET
+            role = EXCLUDED.role,
+            persona_settings = EXCLUDED.persona_settings
+            ${activateAgent ? ", status = 'ACTIVE', paused_until = NULL" : ''}
+        `,
+        [userId, role, JSON.stringify(versionedSettings)]
+      );
+      return nextVersion;
+    }
+
+    const result = await pool.query(
       `
         INSERT INTO user_agents (user_id, role, status, paused_until, persona_settings)
         VALUES ($1, $2, 'ACTIVE', NULL, $3::jsonb)
@@ -318,9 +436,328 @@ async function main() {
           role = EXCLUDED.role,
           persona_settings = EXCLUDED.persona_settings
           ${activateAgent ? ", status = 'ACTIVE', paused_until = NULL" : ''}
+        WHERE COALESCE((user_agents.persona_settings->'_meta'->>'version')::bigint, 0) = $4::bigint
+        RETURNING user_id
       `,
-      [userId, role, JSON.stringify(settings)]
+      [userId, role, JSON.stringify(versionedSettings), expectedVersion],
     );
+    if (result.rowCount === 0) {
+      throw new SettingsVersionConflictError();
+    }
+    return nextVersion;
+  }
+
+  function shouldUseAgentDeskPersistence(): boolean {
+    return Boolean(config.assistant.agentDeskPersistenceV1) && !agentDeskPersistenceSchemaUnavailable;
+  }
+
+  let agentDeskPersistenceSchemaUnavailable = false;
+  let agentDeskPersistenceSchemaWarned = false;
+
+  function isUndefinedTableError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const code = String((error as any).code || '').trim();
+    if (code === '42P01') return true;
+    const message = String((error as any).message || '').toLowerCase();
+    return message.includes('does not exist') && message.includes('agent_desk_');
+  }
+
+  function isAgentDeskAppointmentForeignKeyError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const code = String((error as any).code || '').trim();
+    if (code !== '23503') return false;
+    const constraint = String((error as any).constraint || '').trim();
+    if (constraint === 'agent_desk_messages_appointment_id_fkey') return true;
+    const message = String((error as any).message || '').toLowerCase();
+    return message.includes('agent_desk_messages_appointment_id_fkey');
+  }
+
+  function markAgentDeskPersistenceSchemaUnavailable(reason: string): void {
+    agentDeskPersistenceSchemaUnavailable = true;
+    if (agentDeskPersistenceSchemaWarned) return;
+    agentDeskPersistenceSchemaWarned = true;
+    console.warn('[AGENT] Agent Desk persistence disabled because schema is unavailable', {
+      reason,
+      expectedTables: ['agent_desk_threads', 'agent_desk_messages'],
+      recovery: 'Run migration and restart service.',
+    });
+  }
+
+  function normalizeOptionalUuid(value: unknown): string | undefined {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return undefined;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)
+      ? trimmed
+      : undefined;
+  }
+
+  async function ensureAgentDeskThread(caregiverId: string): Promise<string | null> {
+    if (!shouldUseAgentDeskPersistence()) return null;
+    try {
+      const existing = await pool.query(
+        `
+          SELECT id::text
+          FROM agent_desk_threads
+          WHERE caregiver_id = $1
+          LIMIT 1
+        `,
+        [caregiverId],
+      );
+      if (existing.rows.length > 0) {
+        return String(existing.rows[0].id);
+      }
+
+      const inserted = await pool.query(
+        `
+          INSERT INTO agent_desk_threads (caregiver_id)
+          VALUES ($1)
+          ON CONFLICT (caregiver_id)
+          DO UPDATE SET caregiver_id = EXCLUDED.caregiver_id
+          RETURNING id::text
+        `,
+        [caregiverId],
+      );
+      return String(inserted.rows[0].id);
+    } catch (error) {
+      if (isUndefinedTableError(error)) {
+        markAgentDeskPersistenceSchemaUnavailable('ensureAgentDeskThread');
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async function appendAgentDeskMessage(input: {
+    caregiverId: string;
+    actorType: AgentDeskActorType;
+    content: string;
+    appointmentId?: string;
+    source?: string;
+    metadata?: Record<string, unknown>;
+    dedupeKey?: string;
+    createdAt?: string;
+  }): Promise<string | null> {
+    if (!shouldUseAgentDeskPersistence()) return null;
+    const content = String(input.content || '').trim();
+    if (!content) return null;
+
+    const threadId = await ensureAgentDeskThread(input.caregiverId);
+    if (!threadId) return null;
+    const createdAt = String(input.createdAt || '').trim();
+    const appointmentId = normalizeOptionalUuid(input.appointmentId);
+    const source = String(input.source || 'AGENT_COMMAND').trim() || 'AGENT_COMMAND';
+    const metadata = input.metadata || {};
+    const dedupeKey = String(input.dedupeKey || '').trim() || null;
+
+    const runInsert = async (appointmentIdValue: string | null) => {
+      return pool.query(
+        `
+          INSERT INTO agent_desk_messages (
+            thread_id,
+            appointment_id,
+            actor_type,
+            content,
+            source,
+            metadata,
+            dedupe_key
+            ${createdAt ? ', created_at' : ''}
+          )
+          VALUES (
+            $1::uuid,
+            $2::uuid,
+            $3,
+            $4,
+            $5,
+            $6::jsonb,
+            $7
+            ${createdAt ? ', $8::timestamptz' : ''}
+          )
+          ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+          RETURNING id::text
+        `,
+        createdAt
+          ? [threadId, appointmentIdValue, input.actorType, content, source, JSON.stringify(metadata), dedupeKey, createdAt]
+          : [threadId, appointmentIdValue, input.actorType, content, source, JSON.stringify(metadata), dedupeKey],
+      );
+    };
+
+    try {
+      const result = await (async () => {
+        try {
+          return await runInsert(appointmentId || null);
+        } catch (error) {
+          if (!appointmentId || !isAgentDeskAppointmentForeignKeyError(error)) {
+            throw error;
+          }
+          console.warn('[AGENT] Ignoring stale appointment id for agent desk message persistence', {
+            caregiverId: input.caregiverId,
+            appointmentId,
+            actorType: input.actorType,
+            source,
+          });
+          return runInsert(null);
+        }
+      })();
+
+      if (result.rows.length > 0) {
+        return String(result.rows[0].id);
+      }
+
+      if (!dedupeKey) return null;
+      const existing = await pool.query(
+        `
+          SELECT id::text
+          FROM agent_desk_messages
+          WHERE dedupe_key = $1
+          LIMIT 1
+        `,
+        [dedupeKey],
+      );
+      return existing.rows[0]?.id ? String(existing.rows[0].id) : null;
+    } catch (error) {
+      if (isUndefinedTableError(error)) {
+        markAgentDeskPersistenceSchemaUnavailable('appendAgentDeskMessage');
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async function listAgentDeskMessages(input: {
+    caregiverId: string;
+    limit: number;
+    before?: string;
+  }): Promise<AgentDeskMessageRow[]> {
+    if (!shouldUseAgentDeskPersistence()) return [];
+    try {
+      const threadRes = await pool.query(
+        `
+          SELECT id::text
+          FROM agent_desk_threads
+          WHERE caregiver_id = $1
+          LIMIT 1
+        `,
+        [input.caregiverId],
+      );
+      if (threadRes.rows.length === 0) return [];
+      const threadId = String(threadRes.rows[0].id);
+
+      const beforeIso = String(input.before || '').trim();
+      const params = beforeIso ? [threadId, input.limit, beforeIso] : [threadId, input.limit];
+      const query = beforeIso
+        ? `
+            SELECT
+              m.id::text,
+              t.caregiver_id::text AS caregiver_id,
+              m.thread_id::text AS thread_id,
+              COALESCE(m.appointment_id::text, '') AS appointment_id,
+              m.actor_type,
+              m.content,
+              m.source,
+              m.metadata,
+              m.created_at::text AS created_at
+            FROM agent_desk_messages m
+            INNER JOIN agent_desk_threads t ON t.id = m.thread_id
+            WHERE m.thread_id = $1::uuid
+              AND m.created_at < $3::timestamptz
+            ORDER BY m.created_at DESC
+            LIMIT $2::int
+          `
+        : `
+            SELECT
+              m.id::text,
+              t.caregiver_id::text AS caregiver_id,
+              m.thread_id::text AS thread_id,
+              COALESCE(m.appointment_id::text, '') AS appointment_id,
+              m.actor_type,
+              m.content,
+              m.source,
+              m.metadata,
+              m.created_at::text AS created_at
+            FROM agent_desk_messages m
+            INNER JOIN agent_desk_threads t ON t.id = m.thread_id
+            WHERE m.thread_id = $1::uuid
+            ORDER BY m.created_at DESC
+            LIMIT $2::int
+          `;
+      const result = await pool.query(query, params);
+      return result.rows.map((row) => ({
+        id: String(row.id || ''),
+        caregiverId: String(row.caregiver_id || ''),
+        threadId: String(row.thread_id || ''),
+        appointmentId: normalizeOptionalUuid(row.appointment_id),
+        actorType: String(row.actor_type || 'ASSISTANT').toUpperCase() as AgentDeskActorType,
+        content: String(row.content || ''),
+        source: String(row.source || 'AGENT_COMMAND'),
+        metadata: (row.metadata || {}) as Record<string, unknown>,
+        createdAt: String(row.created_at || ''),
+      }));
+    } catch (error) {
+      if (isUndefinedTableError(error)) {
+        markAgentDeskPersistenceSchemaUnavailable('listAgentDeskMessages');
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  function listLegacyAgentDeskMessagesFromAssistantHistory(input: {
+    caregiverId: string;
+    assistantHistory: AssistantTurn[];
+    limit: number;
+    before?: string;
+  }): AgentDeskMessageRow[] {
+    const beforeMs = input.before ? Date.parse(input.before) : NaN;
+    const hasBefore = Number.isFinite(beforeMs);
+    const rows = [...input.assistantHistory]
+      .filter((turn) => turn.content.trim().length > 0)
+      .filter((turn) => {
+        if (!hasBefore) return true;
+        const createdMs = Date.parse(turn.createdAt);
+        return Number.isFinite(createdMs) && createdMs < beforeMs;
+      })
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+      .slice(0, input.limit);
+    return rows.map((turn, idx) => ({
+      id: `legacy-${idx}-${crypto
+        .createHash('sha1')
+        .update(`${turn.createdAt}|${turn.role}|${turn.content}`)
+        .digest('hex')
+        .slice(0, 20)}`,
+      caregiverId: input.caregiverId,
+      threadId: 'legacy-assistant-history',
+      appointmentId: normalizeOptionalUuid(turn.appointmentId),
+      actorType: turn.role === 'CAREGIVER' ? 'CAREGIVER' : 'ASSISTANT',
+      content: String(turn.content || ''),
+      source: 'LEGACY_ASSISTANT_HISTORY',
+      metadata: {
+        legacy: true,
+        createdAt: turn.createdAt,
+      },
+      createdAt: String(turn.createdAt || ''),
+    }));
+  }
+
+  async function loadDelegationCompilerHistory(caregiverId: string, fallback: AssistantTurn[]): Promise<DelegationContextHistoryLine[]> {
+    if (shouldUseAgentDeskPersistence()) {
+      const rows = await listAgentDeskMessages({
+        caregiverId,
+        limit: 120,
+      });
+      const mapped = rows
+        .slice()
+        .reverse()
+        .map((row) => ({
+          role: row.actorType === 'CAREGIVER' ? 'CAREGIVER' : 'ASSISTANT',
+          content: String(row.content || ''),
+          createdAt: row.createdAt,
+        }))
+        .filter((row) => row.content.trim().length > 0);
+      if (mapped.length > 0) {
+        return mapped.slice(-120);
+      }
+    }
+    return toDelegationContextHistoryLines(fallback);
   }
 
   function getAssistantState(settings: AgentPersonaSettings): AgentAssistantState {
@@ -334,12 +771,19 @@ async function main() {
               role,
               content: String((row as any)?.content || '').trim(),
               createdAt: String((row as any)?.createdAt || new Date().toISOString()),
+              appointmentId: (row as any)?.appointmentId ? String((row as any).appointmentId) : undefined,
             };
           })
           .filter((row) => row.content.length > 0)
       : [];
     const pendingRaw = raw.pending as Partial<AssistantPendingState> | undefined;
-    const validPendingKinds = new Set(['MAPS_HOME_ADDRESS', 'CLIENT_INFO_CONTEXT', 'DELEGATION_CONTEXT']);
+    const validPendingKinds = new Set([
+      'MAPS_HOME_ADDRESS',
+      'CLIENT_INFO_CONTEXT',
+      'DELEGATION_CONTEXT',
+      'DELEGATION_TARGET_CONTEXT',
+      'DELEGATION_CONTACT_CONFIRM',
+    ]);
     const validPendingTools = new Set(['MAPS_ROUTE', 'CLIENT_INFO', 'START_DELEGATION']);
     const pending =
       pendingRaw &&
@@ -373,12 +817,18 @@ async function main() {
     state: AgentAssistantState,
     role: AssistantTurn['role'],
     content: string,
+    options?: { appointmentId?: string },
   ): AgentAssistantState {
     const trimmed = String(content || '').trim();
     if (!trimmed) return state;
     const nextHistory = [
       ...(state.history || []),
-      { role, content: trimmed, createdAt: new Date().toISOString() },
+      {
+        role,
+        content: trimmed,
+        createdAt: new Date().toISOString(),
+        appointmentId: options?.appointmentId || state.memory?.appointmentId,
+      },
     ];
     return { ...state, history: nextHistory.slice(-40) };
   }
@@ -439,76 +889,453 @@ async function main() {
     };
   }
 
-  function combineCommandWithPending(state: AgentAssistantState, command: string): string {
-    if (!state.pending) return command;
-    if (!shouldMergeWithPending(state, command)) return command;
-    return `${state.pending.baseCommand}\nAdditional caregiver details: ${command}`;
+  function targetAppointmentFromResolved(
+    resolved: { appointmentId: string; clientId: string; clientName: string; appointmentStartTime?: string } | null,
+    appointments: CaregiverAppointmentRow[],
+  ): CaregiverAppointmentRow | null {
+    if (!resolved) return null;
+    const byId = appointments.find((row) => row.appointmentId === resolved.appointmentId);
+    if (byId) return byId;
+    return (
+      appointments.find(
+        (row) =>
+          row.clientId === resolved.clientId &&
+          row.clientName === resolved.clientName &&
+          row.startTime === String(resolved.appointmentStartTime || ''),
+      ) || null
+    );
   }
 
-  function isCancellationMessage(command: string): boolean {
-    const normalized = normalizeCommandText(command);
-    return includesAnyTerm(normalized, ['cancel', 'never mind', 'nevermind', 'ignore that', 'stop']);
+  function combineCommandWithPending(
+    state: AgentAssistantState,
+    command: string,
+    mergeWithPending: boolean,
+  ): string {
+    if (!state.pending || !mergeWithPending) return command;
+    return `${state.pending.baseCommand}\nLatest caregiver clarification (if any detail conflicts with earlier text, prioritize this clarification): ${command}`;
   }
 
-  function looksLikeAddressInput(command: string): boolean {
-    const value = String(command || '');
-    return /\d{2,}/.test(value) && /(?:street|st|road|rd|avenue|ave|blvd|boulevard|lane|ln|drive|dr|court|ct|apt|unit|suite|#)/i.test(value);
+  async function analyzeCaregiverTurnWithLLM(input: {
+    command: string;
+    assistantState: AgentAssistantState;
+  }): Promise<CaregiverTurnSignals> {
+    const deterministic = detectDeterministicTurnSignals({
+      command: input.command,
+      hasPending: Boolean(input.assistantState.pending),
+    });
+    if (deterministic.confident) {
+      return deterministic.signals;
+    }
+
+    const defaults: CaregiverTurnSignals = {
+      isGreeting: false,
+      isAcknowledgement: false,
+      isCancellation: false,
+      mergeWithPending: false,
+      executePending: false,
+    };
+    if (!config.openai.apiKey) return defaults;
+
+    try {
+      const pendingSummary = input.assistantState.pending
+        ? `Pending task: kind=${input.assistantState.pending.kind}, tool=${input.assistantState.pending.tool}, baseCommand="${input.assistantState.pending.baseCommand}", createdAt=${input.assistantState.pending.createdAt}`
+        : 'Pending task: none';
+
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Classify the caregiver's latest message for conversation control.
+- isGreeting: true only when message is primarily a greeting/opening.
+- isAcknowledgement: true only when message is mainly acknowledgement/thanks with no new request.
+- isCancellation: true only when message clearly cancels the current in-progress request.
+- mergeWithPending: true only when a pending task exists and this message should continue that same task.
+- executePending: true only when a pending task exists and the caregiver's latest message should trigger execution now (for example confirming or supplying the needed detail).
+
+Use semantics and context, not keyword lists.
+Return:
+{
+  "isGreeting": true|false,
+  "isAcknowledgement": true|false,
+  "isCancellation": true|false,
+  "mergeWithPending": true|false,
+  "executePending": true|false
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                pendingSummary,
+                `Recent assistant history:\n${compactAssistantHistory(input.assistantState.history, 8)}`,
+                `Latest caregiver message: ${input.command}`,
+              ].join('\n\n'),
+            },
+          ],
+        }),
+      });
+
+      if (!response.ok) return defaults;
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return defaults;
+      const parsed = JSON.parse(raw) as Partial<CaregiverTurnSignals>;
+      return {
+        isGreeting: Boolean(parsed?.isGreeting),
+        isAcknowledgement: Boolean(parsed?.isAcknowledgement),
+        isCancellation: Boolean(parsed?.isCancellation),
+        mergeWithPending: Boolean(parsed?.mergeWithPending) && Boolean(input.assistantState.pending),
+        executePending: Boolean(parsed?.executePending) && Boolean(input.assistantState.pending),
+      };
+    } catch {
+      return defaults;
+    }
   }
 
-  function looksLikeGreeting(command: string): boolean {
+  function buildPendingToolDecision(
+    state: AgentAssistantState,
+    mergedCommand: string,
+  ): AssistantPlannerDecision | null {
+    if (!state.pending) return null;
+    return {
+      action: 'USE_TOOL',
+      tool: state.pending.tool,
+      infoQuestion: state.pending.tool === 'CLIENT_INFO' ? mergedCommand : undefined,
+      objective: state.pending.tool === 'START_DELEGATION' ? mergedCommand : undefined,
+    };
+  }
+
+  function normalizeForComparison(value: string): string {
+    return String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function isRepeatedAssistantPrompt(history: AssistantTurn[], candidate: string): boolean {
+    const normalizedCandidate = normalizeForComparison(candidate);
+    if (!normalizedCandidate) return false;
+    const recentAssistantTurns = history.filter((turn) => turn.role === 'ASSISTANT').slice(-3);
+    const repeats = recentAssistantTurns.filter(
+      (turn) => normalizeForComparison(turn.content) === normalizedCandidate,
+    ).length;
+    return repeats >= 1;
+  }
+
+  function getActiveDelegationAppointmentIds(settings: AgentPersonaSettings): Set<string> {
+    const active = new Set<string>();
+    const now = Date.now();
+    const delegations = settings.delegations || {};
+    for (const [appointmentId, entry] of Object.entries(delegations)) {
+      if (!entry || !entry.active) continue;
+      const endsAtMs = Date.parse(String(entry.endsAt || ''));
+      if (Number.isFinite(endsAtMs) && endsAtMs > now) {
+        active.add(appointmentId);
+      }
+    }
+    return active;
+  }
+
+  function hasRelevantActiveDelegation(input: {
+    settings: AgentPersonaSettings;
+    appointmentId?: string;
+  }): boolean {
+    const activeAppointmentIds = getActiveDelegationAppointmentIds(input.settings);
+    if (activeAppointmentIds.size === 0) return false;
+    const appointmentId = normalizeOptionalUuid(input.appointmentId);
+    if (appointmentId) return activeAppointmentIds.has(appointmentId);
+    return true;
+  }
+
+  function enforceDelegationStateClaims(input: {
+    response: string;
+    hasRelevantActiveDelegation: boolean;
+  }): string {
+    const trimmed = String(input.response || '').trim();
+    if (!trimmed || input.hasRelevantActiveDelegation) return trimmed;
+
+    const sentenceHasInvalidDelegationClaim = (sentence: string): boolean => {
+      const normalized = normalizeCommandText(sentence);
+      if (!normalized) return false;
+      return (
+        /\b(already|currently|still)\b.*\b(started|initiated|have)\b.*\bdelegation\b/.test(normalized) ||
+        /\bactive delegation\b/.test(normalized) ||
+        /\bwait(?:ing)? for (a|the) response\b/.test(normalized) ||
+        /\bdelegation (is|has been) (active|started|initiated)\b/.test(normalized)
+      );
+    };
+
+    const sentences = trimmed.match(/[^.!?]+[.!?]?/g) || [trimmed];
+    const filtered = sentences.filter((sentence) => !sentenceHasInvalidDelegationClaim(sentence));
+    if (filtered.length === 0) {
+      return 'I have not started delegation for that yet. I can contact the client/family if you want.';
+    }
+    return filtered.join(' ').trim();
+  }
+
+  function enforceNonToolResponseSafety(input: {
+    response: string;
+    command: string;
+    hasRelevantActiveDelegation: boolean;
+  }): string {
+    const trimmed = enforceDelegationStateClaims({
+      response: input.response,
+      hasRelevantActiveDelegation: input.hasRelevantActiveDelegation,
+    });
+    if (!trimmed) return trimmed;
+
+    const claimsExecution =
+      /\b(i|we)\s+(?:have|ve|had|just)?\s*(?:initiated|started|sent|reached out|contacted|messaged|asked)\b/i.test(trimmed) ||
+      /\brequest (?:has been|was) sent\b/i.test(trimmed);
+    if (claimsExecution) {
+      if (hasDelegationIntent(input.command)) {
+        return 'I have not contacted them yet in this turn. I can start delegation now to ask those questions.';
+      }
+      return trimmed.replace(
+        /\b(i|we)\s+(?:have|ve|had|just)?\s*(?:initiated|started|sent|reached out|contacted|messaged|asked)\b[^.]*[.]?/gi,
+        '',
+      ).trim() || 'I have not executed that action yet in this turn.';
+    }
+
+    return trimmed;
+  }
+
+  function indicatesUnknownOrIncompleteInfo(text: string): boolean {
+    const normalized = normalizeCommandText(text);
+    if (!normalized) return false;
+    return (
+      /\b(i do not have|i don't have|i currently do not have|i currently don't have)\b/.test(normalized) ||
+      /\b(i cannot confirm|i can't confirm|i cannot verify|i can't verify)\b/.test(normalized) ||
+      /\b(could not find enough detail|couldn't find enough detail|insufficient evidence|not enough detail)\b/.test(normalized) ||
+      /\b(no messages yet|no information yet)\b/.test(normalized) ||
+      /\b(recommend reaching out|reach out directly|contact .* directly)\b/.test(normalized)
+    );
+  }
+
+  function commandRequestsFindOut(command: string): boolean {
     const normalized = normalizeCommandText(command);
     if (!normalized) return false;
-    return /^(hi|hello|hey|good morning|good afternoon|good evening)\b/.test(normalized);
+    return (
+      /\bfind out\b/.test(normalized) ||
+      /\bif you do not know\b/.test(normalized) ||
+      /\bif you don't know\b/.test(normalized) ||
+      /\bcan you verify\b/.test(normalized) ||
+      /\bcan you confirm\b/.test(normalized) ||
+      /\bcheck for me\b/.test(normalized)
+    );
   }
 
-  function looksLikeAcknowledgement(command: string): boolean {
+  function looksLikeClientFactQuestion(command: string): boolean {
     const normalized = normalizeCommandText(command);
     if (!normalized) return false;
-    const tokens = normalized.split(' ').filter(Boolean);
-    if (tokens.length > 4) return false;
-    return /^(ok|okay|k|got it|sounds good|thanks|thank you|cool|alright|all good|understood|so)$/.test(normalized);
+    const personRef =
+      /\b(client|family|parent|guardian|patient|him|her|them)\b/.test(normalized) ||
+      /\b[a-z][a-z'-]{1,}'s\b/.test(normalized) ||
+      /\b(?:does|did|is|has|have)\s+[a-z][a-z'-]{1,}\b/.test(normalized);
+    const factCue =
+      /\b(fridge|refrigerator|food|house|home|advil|ibuprofen|med|medicine|supplies|dog|pet|access|code)\b/.test(normalized) ||
+      /\b(does|is|has|have)\b/.test(normalized);
+    return personRef && factCue;
   }
 
-  function mapIntentToPlannerTool(intent: AgentCommandIntent): AssistantPlannerTool | null {
-    if (intent === 'SCHEDULE_OVERVIEW') return 'SCHEDULE_DAY';
-    if (intent === 'MAPS_ROUTE') return 'MAPS_ROUTE';
-    if (intent === 'START_DELEGATION') return 'START_DELEGATION';
-    if (intent === 'LOOKUP_ACCESS_CODE' || intent === 'CLIENT_INFO_LOOKUP') return 'CLIENT_INFO';
-    return null;
+  function buildDelegationContactConfirmationPrompt(knownInfoPrefix?: string): string {
+    const prefix = String(knownInfoPrefix || '').trim();
+    const confirmation =
+      'I can contact the client/family to find out the missing details. Do you want me to reach out now? Reply yes to proceed or cancel to stop.';
+    return prefix ? `${prefix}\n\n${confirmation}` : confirmation;
   }
 
-  function tokensCount(command: string): number {
-    return normalizeCommandText(command)
-      .split(' ')
-      .filter(Boolean).length;
+  async function evaluateMissingInfoPolicy(input: {
+    command: string;
+    answerDraft: string;
+    source: 'RESPOND' | 'CLIENT_INFO';
+  }): Promise<MissingInfoPolicyDecision> {
+    const deterministicAcquire =
+      hasExplicitDelegationDirective(input.command) ||
+      (hasDelegationIntent(input.command) && commandRequestsFindOut(input.command)) ||
+      (looksLikeClientFactQuestion(input.command) && indicatesUnknownOrIncompleteInfo(input.answerDraft));
+    if (!config.openai.apiKey) {
+      return deterministicAcquire
+        ? { action: 'ACQUIRE_MISSING_INFO', confidence: 0.9, rationale: 'deterministic_missing_info_policy' }
+        : { action: 'ANSWER_FROM_KNOWN_INFO', confidence: 0.9, rationale: 'deterministic_known_info_policy' };
+    }
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Decide whether the assistant should only answer from known information or should acquire missing information by contacting client/family (delegation).
+
+Use these actions only:
+- ANSWER_FROM_KNOWN_INFO
+- ACQUIRE_MISSING_INFO
+
+Rules:
+- Choose ACQUIRE_MISSING_INFO when caregiver asks for client/family facts that are still unknown/incomplete and asks to find out/verify/contact.
+- Choose ANSWER_FROM_KNOWN_INFO when answer is complete enough or request is not asking for client/family fact acquisition.
+- If unsure, prefer ACQUIRE_MISSING_INFO only when command clearly requests finding out missing facts.
+
+Return:
+{
+  "action": "ANSWER_FROM_KNOWN_INFO|ACQUIRE_MISSING_INFO",
+  "confidence": 0-1,
+  "rationale": "short string"
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                `Source path: ${input.source}`,
+                `Caregiver command: ${input.command}`,
+                `Draft answer: ${input.answerDraft}`,
+                `Deterministic hint: ${deterministicAcquire ? 'ACQUIRE_MISSING_INFO' : 'ANSWER_FROM_KNOWN_INFO'}`,
+              ].join('\n\n'),
+            },
+          ],
+        }),
+      });
+      if (!response.ok) {
+        return deterministicAcquire
+          ? { action: 'ACQUIRE_MISSING_INFO', confidence: 0.8, rationale: 'fallback_after_policy_http_error' }
+          : { action: 'ANSWER_FROM_KNOWN_INFO', confidence: 0.8, rationale: 'fallback_after_policy_http_error' };
+      }
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      const parsed = tryParseJsonObject(raw) || {};
+      const actionRaw = String(parsed?.action || '').trim().toUpperCase();
+      const confidenceRaw = Number(parsed?.confidence);
+      const confidence = Number.isFinite(confidenceRaw) ? Math.max(0, Math.min(1, confidenceRaw)) : 0.5;
+      const rationale = String(parsed?.rationale || '').trim() || 'llm_policy';
+      if (actionRaw === 'ACQUIRE_MISSING_INFO') {
+        return { action: 'ACQUIRE_MISSING_INFO', confidence, rationale };
+      }
+      if (actionRaw === 'ANSWER_FROM_KNOWN_INFO') {
+        return { action: 'ANSWER_FROM_KNOWN_INFO', confidence, rationale };
+      }
+      return deterministicAcquire
+        ? { action: 'ACQUIRE_MISSING_INFO', confidence: 0.75, rationale: 'deterministic_fallback_after_invalid_policy_json' }
+        : { action: 'ANSWER_FROM_KNOWN_INFO', confidence: 0.75, rationale: 'deterministic_fallback_after_invalid_policy_json' };
+    } catch {
+      return deterministicAcquire
+        ? { action: 'ACQUIRE_MISSING_INFO', confidence: 0.75, rationale: 'deterministic_fallback_after_policy_exception' }
+        : { action: 'ANSWER_FROM_KNOWN_INFO', confidence: 0.75, rationale: 'deterministic_fallback_after_policy_exception' };
+    }
   }
 
-  function shouldMergeWithPending(state: AgentAssistantState, command: string): boolean {
-    if (!state.pending) return false;
-    const pendingCreatedMs = new Date(state.pending.createdAt).getTime();
-    if (Number.isFinite(pendingCreatedMs) && Date.now() - pendingCreatedMs > 45 * 60 * 1000) {
-      return false;
+  async function sanitizeNonToolAssistantResponse(input: {
+    response: string;
+    command: string;
+    assistantState: AgentAssistantState;
+    appointments: CaregiverAppointmentRow[];
+    settings: AgentPersonaSettings;
+    appointmentIdHint?: string;
+  }): Promise<string> {
+    const trimmed = String(input.response || '').trim();
+    if (!trimmed) return trimmed;
+    const hasActiveDelegationForContext = hasRelevantActiveDelegation({
+      settings: input.settings,
+      appointmentId: input.appointmentIdHint || input.assistantState.memory?.appointmentId,
+    });
+    if (!config.openai.apiKey) {
+      return enforceNonToolResponseSafety({
+        response: trimmed,
+        command: input.command,
+        hasRelevantActiveDelegation: hasActiveDelegationForContext,
+      });
     }
 
-    const normalized = normalizeCommandText(command);
-    if (!normalized) return true;
+    try {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
 
-    const explicitIntent = mapIntentToPlannerTool(detectAgentCommandIntent(command));
-    if (explicitIntent && explicitIntent !== state.pending.tool) {
-      return false;
+This assistant response is for a turn where no backend tool was executed.
+Decide whether the draft response incorrectly claims or implies that an external/system action was already executed in this turn.
+If it does, rewrite it so it stays helpful but clearly avoids claiming execution.
+If it does not, return the response unchanged.
+
+Return:
+{
+  "safeResponse": "string",
+  "claimsExecution": true|false
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                `Latest caregiver message: ${input.command}`,
+                `Recent assistant history:\n${compactAssistantHistory(input.assistantState.history, 8)}`,
+                `Appointment snapshot:\n${summarizeAppointmentsForPlanner(input.appointments, 6)}`,
+                `Draft response:\n${trimmed}`,
+              ].join('\n\n'),
+            },
+          ],
+        }),
+      });
+      if (!res.ok) {
+        return enforceNonToolResponseSafety({
+          response: trimmed,
+          command: input.command,
+          hasRelevantActiveDelegation: hasActiveDelegationForContext,
+        });
+      }
+      const payload = (await res.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) {
+        return enforceNonToolResponseSafety({
+          response: trimmed,
+          command: input.command,
+          hasRelevantActiveDelegation: hasActiveDelegationForContext,
+        });
+      }
+      const parsed = JSON.parse(raw) as { safeResponse?: unknown };
+      const safeResponse = String(parsed?.safeResponse || '').trim();
+      return enforceNonToolResponseSafety({
+        response: safeResponse || trimmed,
+        command: input.command,
+        hasRelevantActiveDelegation: hasActiveDelegationForContext,
+      });
+    } catch {
+      return enforceNonToolResponseSafety({
+        response: trimmed,
+        command: input.command,
+        hasRelevantActiveDelegation: hasActiveDelegationForContext,
+      });
     }
-
-    if (state.pending.kind === 'MAPS_HOME_ADDRESS') {
-      return looksLikeAddressInput(command) || tokensCount(command) <= 12;
-    }
-
-    if (state.pending.kind === 'CLIENT_INFO_CONTEXT' || state.pending.kind === 'DELEGATION_CONTEXT') {
-      if (extractClientHint(command)) return true;
-      if (Boolean(parseBusinessDateHint(command))) return true;
-      return tokensCount(command) <= 14;
-    }
-
-    return false;
   }
 
   function inferToolForFollowUp(
@@ -516,51 +1343,97 @@ async function main() {
     assistantState: AgentAssistantState,
     commandForPlanning: string,
   ): AssistantPlannerTool | undefined {
+    void commandForPlanning;
     if (plannerDecision.tool) return plannerDecision.tool;
     if (assistantState.pending?.tool) {
       return assistantState.pending.tool as AssistantPlannerTool;
     }
-    return mapIntentToPlannerTool(detectAgentCommandIntent(commandForPlanning)) || undefined;
+    return undefined;
   }
 
-  function shiftIsoDate(dateIso: string, deltaDays: number): string {
-    const base = new Date(`${dateIso}T00:00:00-08:00`);
-    if (Number.isNaN(base.getTime())) return dateIso;
-    base.setUTCDate(base.getUTCDate() + deltaDays);
-    const year = base.getUTCFullYear();
-    const month = String(base.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(base.getUTCDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+  function buildFollowUpQuestionFromRequiredSlots(
+    requiredSlots: AssistantRequiredSlot[] | undefined,
+    fallbackTool?: AssistantPlannerTool,
+  ): string | null {
+    const slots = Array.isArray(requiredSlots) ? requiredSlots : [];
+    if (slots.includes('HOME_ADDRESS')) {
+      return 'What is your home address so I can calculate that route?';
+    }
+    if (slots.includes('APPOINTMENT_TARGET')) {
+      return 'Which client or visit should I use?';
+    }
+    if (slots.includes('CLIENT_INFO_QUESTION')) {
+      return 'What specific client detail should I look up?';
+    }
+    if (slots.includes('DELEGATION_OBJECTIVE')) {
+      return 'What exactly should I ask the client or family to confirm?';
+    }
+    if (fallbackTool === 'MAPS_ROUTE') return 'What is your home address so I can calculate that route?';
+    if (fallbackTool === 'CLIENT_INFO') return 'Which client or visit should I use for that lookup?';
+    if (fallbackTool === 'START_DELEGATION') return 'Which visit should I delegate, and what should I ask?';
+    return null;
+  }
+
+  function maybeDeterministicFallbackPlannerDecision(input: {
+    command: string;
+    turnSignals: CaregiverTurnSignals;
+    assistantState: AgentAssistantState;
+  }): AssistantPlannerDecision | null {
+    const normalized = normalizeCommandText(input.command);
+    if (!normalized) return null;
+
+    if (input.assistantState.pending && (input.turnSignals.executePending || input.turnSignals.mergeWithPending)) {
+      return buildPendingToolDecision(input.assistantState, combineCommandWithPending(input.assistantState, input.command, true));
+    }
+
+    const scheduleIntent = /\b(schedule|appointments|visits?|day|shift|gaps?)\b/.test(normalized);
+    const mapsIntent = /\b(route|routes|map|maps|drive|driving|traffic|travel|eta)\b/.test(normalized);
+    const clientInfoIntent =
+      /\b(access code|history|what did|what has|said about|notes|client info|family said|care plan update|meds update)\b/.test(
+        normalized,
+      ) ||
+      /\b(access)\b/.test(normalized);
+    const delegationIntent = hasDelegationIntent(input.command);
+
+    if (mapsIntent) {
+      return {
+        action: 'USE_TOOL',
+        tool: 'MAPS_ROUTE',
+      };
+    }
+
+    if (delegationIntent) {
+      return {
+        action: 'USE_TOOL',
+        tool: 'START_DELEGATION',
+        objective: input.command.trim(),
+      };
+    }
+
+    if (clientInfoIntent && !scheduleIntent) {
+      return {
+        action: 'USE_TOOL',
+        tool: 'CLIENT_INFO',
+        infoQuestion: input.command.trim(),
+      };
+    }
+
+    if (scheduleIntent) {
+      return {
+        action: 'USE_TOOL',
+        tool: 'SCHEDULE_DAY',
+      };
+    }
+
+    return null;
   }
 
   function parseBusinessDateHint(command: string): string | null {
-    const normalized = normalizeCommandText(command);
-    const today = getCurrentBusinessDateIso();
-    if (normalized.includes('yesterday')) return shiftIsoDate(today, -1);
-    if (normalized.includes('today')) return today;
-    if (normalized.includes('tomorrow')) return shiftIsoDate(today, 1);
+    return parseBusinessDateHintPolicy(command, getCurrentBusinessDateIso());
+  }
 
-    const isoMatch = String(command).match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
-    if (isoMatch) {
-      const year = Number(isoMatch[1]);
-      const month = Number(isoMatch[2]);
-      const day = Number(isoMatch[3]);
-      if (year >= 2000 && year <= 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-        return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      }
-    }
-
-    const mdMatch = String(command).match(/\b(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?\b/);
-    if (!mdMatch) return null;
-    const month = Number(mdMatch[1]);
-    const day = Number(mdMatch[2]);
-    const nowYear = Number(today.slice(0, 4));
-    let year = mdMatch[3] ? Number(mdMatch[3]) : nowYear;
-    if (year < 100) year += 2000;
-    if (year < 2000 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) {
-      return null;
-    }
-    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  function resolveRequestedBusinessDate(command: string, memoryBusinessDateHint?: string): string {
+    return resolveRequestedBusinessDatePolicy(command, memoryBusinessDateHint, getCurrentBusinessDateIso());
   }
 
   function compactAssistantHistory(history: AssistantTurn[], limit = 10): string {
@@ -580,6 +1453,26 @@ async function main() {
           )} | status=${appt.appointmentStatus} | location=${appt.locationAddress || 'unknown'}`,
       )
       .join('\n');
+  }
+
+  function tryParseJsonObject(raw: string): any | null {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      const firstBrace = text.indexOf('{');
+      const lastBrace = text.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        const candidate = text.slice(firstBrace, lastBrace + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
   }
 
   function normalizeAssistantPlannerDecision(raw: any): AssistantPlannerDecision | null {
@@ -603,18 +1496,105 @@ async function main() {
     const questions = Array.isArray(raw.questions)
       ? raw.questions.map((q: unknown) => String(q || '').trim()).filter(Boolean).slice(0, 6)
       : undefined;
+    const requiredSlotsRaw = Array.isArray(raw.requiredSlots)
+      ? raw.requiredSlots
+      : Array.isArray(raw.required_slots)
+      ? raw.required_slots
+      : [];
+    const responseStyleRaw = raw.responseStyle ?? raw.response_style;
 
     return {
       action: action as AssistantPlannerDecision['action'],
       response: raw.response ? String(raw.response).trim() : undefined,
-      followUpQuestion: raw.followUpQuestion ? String(raw.followUpQuestion).trim() : undefined,
+      followUpQuestion: (raw.followUpQuestion || raw.follow_up_question)
+        ? String(raw.followUpQuestion || raw.follow_up_question).trim()
+        : undefined,
       tool: normalizedTool,
-      homeAddress: raw.homeAddress ? String(raw.homeAddress).trim() : undefined,
-      appointmentHint: raw.appointmentHint ? String(raw.appointmentHint).trim() : undefined,
+      homeAddress: (raw.homeAddress || raw.home_address) ? String(raw.homeAddress || raw.home_address).trim() : undefined,
+      appointmentHint: (raw.appointmentHint || raw.appointment_hint)
+        ? String(raw.appointmentHint || raw.appointment_hint).trim()
+        : undefined,
       objective: raw.objective ? String(raw.objective).trim() : undefined,
       questions,
-      infoQuestion: raw.infoQuestion ? String(raw.infoQuestion).trim() : undefined,
+      infoQuestion: (raw.infoQuestion || raw.info_question) ? String(raw.infoQuestion || raw.info_question).trim() : undefined,
+      requiredSlots: normalizeRequiredSlots(requiredSlotsRaw),
+      responseStyle: normalizeResponseStyle(responseStyleRaw),
     };
+  }
+
+  async function repairPlannerDecisionWithLLM(input: {
+    rawContent: string;
+    allowFollowUp: boolean;
+  }): Promise<AssistantPlannerDecision | null> {
+    if (!config.openai.apiKey) return null;
+
+    try {
+      const allowedActions = input.allowFollowUp
+        ? 'RESPOND, ASK_FOLLOW_UP, USE_TOOL'
+        : 'RESPOND, USE_TOOL';
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+You normalize a malformed assistant-planner output into the required schema.
+Allowed action values: ${allowedActions}.
+Allowed tool values: SCHEDULE_DAY, MAPS_ROUTE, CLIENT_INFO, START_DELEGATION.
+If the malformed output is ambiguous, choose the safest valid action with minimal speculation.
+
+Return this schema exactly:
+{
+  "action": "RESPOND|ASK_FOLLOW_UP|USE_TOOL",
+  "response": "string optional",
+  "followUpQuestion": "string optional",
+  "tool": "SCHEDULE_DAY|MAPS_ROUTE|CLIENT_INFO|START_DELEGATION optional",
+  "homeAddress": "string optional",
+  "appointmentHint": "string optional",
+  "objective": "string optional",
+  "questions": ["string"] optional,
+  "infoQuestion": "string optional",
+  "required_slots": ["APPOINTMENT_TARGET|HOME_ADDRESS|CLIENT_INFO_QUESTION|DELEGATION_OBJECTIVE"] optional,
+  "response_style": "CONCISE|STEP_BY_STEP optional"
+}`,
+            },
+            {
+              role: 'user',
+              content: `Malformed planner output:\n${input.rawContent}`,
+            },
+          ],
+        }),
+      });
+      if (!response.ok) return null;
+      const payload = (await response.json()) as any;
+      const normalizedRaw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!normalizedRaw) return null;
+      const parsed = tryParseJsonObject(normalizedRaw);
+      if (!parsed) return null;
+      const normalized = normalizeAssistantPlannerDecision(parsed);
+      if (!normalized) return null;
+      if (!input.allowFollowUp && normalized.action === 'ASK_FOLLOW_UP') {
+        if (normalized.tool) {
+          return {
+            ...normalized,
+            action: 'USE_TOOL',
+          };
+        }
+        return { action: 'RESPOND' };
+      }
+      return normalized;
+    } catch {
+      return null;
+    }
   }
 
   async function planAssistantDecisionWithLLM(input: {
@@ -656,15 +1636,23 @@ Available tools:
 3) CLIENT_INFO: search historical messages for client-related details.
 4) START_DELEGATION: start client delegation window.
 
-Rules:
-- If tool is unnecessary (small talk, generic advice, unsupported request), use RESPOND.
-- If map request needs home address and missing, use ASK_FOLLOW_UP and ask for home address.
-- If client is ambiguous/missing for CLIENT_INFO or START_DELEGATION, ASK_FOLLOW_UP for client/visit.
-- For questions about what was said in chat/messages (food in fridge, access code, "what did they say"), prefer CLIENT_INFO.
-- Reuse pending context when present. If pending maps request and current message provides address, call MAPS_ROUTE with homeAddress.
-- If the caregiver answers your follow-up with short text ("general", "yes", a date, an address), continue the previous pending task instead of resetting topic.
+Decision policy:
+- Use RESPOND for conversational/general requests or when no system data/tool is needed.
+- Use USE_TOOL when an accurate answer depends on schedule data, map estimates, chat history retrieval, or delegation actions.
+- First decide whether caregiver needs known-info answer vs missing-info acquisition. For missing client/family facts, prefer START_DELEGATION over a dead-end RESPOND.
+- Use ASK_FOLLOW_UP only when a required input is missing; ask exactly one concise question.
+- When action is ASK_FOLLOW_UP, list missing structured slots in "required_slots".
+- Prefer proceeding with best available defaults over additional clarification whenever safe.
+- Reuse pending context and memory to continue in-progress tasks rather than resetting topics.
+- For requests outside available tools (for example external real-time data not connected here), respond directly with limits instead of follow-up loops.
+- If the caregiver asks you to contact a client/family (including a named person, e.g. "ask Yashwanth if..."), choose START_DELEGATION.
+- Treat "if you don't know, can you find out for me" (or equivalent) as START_DELEGATION when the request is about client/family facts.
+- Never return RESPOND for explicit caregiver outreach directives ("can you ask/reach out/contact ..."); use START_DELEGATION.
+- If a pending task exists and the caregiver confirms/proceeds or supplies requested detail, choose USE_TOOL for that pending task.
+- Avoid confirmation loops. If target appointment can be inferred from context/history, choose USE_TOOL instead of ASK_FOLLOW_UP.
 - If action is ASK_FOLLOW_UP, include the intended tool in "tool".
-- Keep tone concise and practical.
+- Keep outputs concise and operational.
+- Set "response_style" to CONCISE by default. Use STEP_BY_STEP only when caregiver asks for a walkthrough.
 
 Output schema:
 {
@@ -676,7 +1664,9 @@ Output schema:
   "appointmentHint": "string optional",
   "objective": "string optional for START_DELEGATION",
   "questions": ["string"] optional for START_DELEGATION,
-  "infoQuestion": "string optional for CLIENT_INFO"
+  "infoQuestion": "string optional for CLIENT_INFO",
+  "required_slots": ["APPOINTMENT_TARGET|HOME_ADDRESS|CLIENT_INFO_QUESTION|DELEGATION_OBJECTIVE"] optional,
+  "response_style": "CONCISE|STEP_BY_STEP optional"
 }`,
       },
       {
@@ -718,18 +1708,126 @@ Output schema:
     if (!rawContent) {
       throw new Error('Assistant planner returned empty content.');
     }
-    const parsed = JSON.parse(rawContent);
-    const decision = normalizeAssistantPlannerDecision(parsed);
+    const parsed = tryParseJsonObject(rawContent);
+    let decision = normalizeAssistantPlannerDecision(parsed);
+    if (!decision && shouldUsePlannerRepairHop(config.assistant)) {
+      decision = await repairPlannerDecisionWithLLM({
+        rawContent,
+        allowFollowUp: true,
+      });
+    }
     if (!decision) {
       throw new Error('Assistant planner returned invalid decision payload.');
     }
+    decision = applyRouterContractDefaults(decision);
 
     console.log('[AGENT] Planner decision', {
       action: decision.action,
       tool: decision.tool || null,
+      requiredSlots: decision.requiredSlots || [],
+      responseStyle: decision.responseStyle || 'CONCISE',
       latencyMs: Date.now() - startedAt,
     });
     return decision;
+  }
+
+  async function recoverToolDecisionWithLLM(input: {
+    command: string;
+    assistantState: AgentAssistantState;
+    appointments: CaregiverAppointmentRow[];
+    requestedAppointmentId?: string;
+  }): Promise<AssistantPlannerDecision | null> {
+    if (!config.openai.apiKey) {
+      return null;
+    }
+
+    try {
+      const pendingSummary = input.assistantState.pending
+        ? `Pending: kind=${input.assistantState.pending.kind}, tool=${input.assistantState.pending.tool}, baseCommand="${input.assistantState.pending.baseCommand}"`
+        : 'Pending: none';
+
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+You are a strict operation router for caregiver assistant messages.
+Choose one action:
+- RESPOND: conversational answer only.
+- USE_TOOL: execute exactly one tool.
+
+Available tools:
+- SCHEDULE_DAY
+- MAPS_ROUTE
+- CLIENT_INFO
+- START_DELEGATION
+
+Policy:
+- Choose USE_TOOL when the caregiver is asking for an operation or data retrieval supported by tools.
+- If caregiver wants the assistant to contact/reach out/ask a client or family member (including a named person), choose START_DELEGATION.
+- Treat "find out for me" about a client/family person as START_DELEGATION.
+- Never answer with "I cannot directly ask/contact" when outreach is requested; choose START_DELEGATION instead.
+- If pending context exists and the caregiver gives a short follow-up or confirmation, continue with that pending tool.
+- Treat brief confirmations/approvals as execute-intent when they follow a recent assistant proposal for a tool action.
+- Avoid asking another follow-up if a tool can run with currently available context.
+- Choose RESPOND for general conversation or requests outside available tools.
+- Never return ASK_FOLLOW_UP in this classifier.
+
+Output schema:
+{
+  "action": "RESPOND|USE_TOOL",
+  "tool": "SCHEDULE_DAY|MAPS_ROUTE|CLIENT_INFO|START_DELEGATION optional",
+  "appointmentHint": "string optional",
+  "objective": "string optional",
+  "questions": ["string"] optional,
+  "infoQuestion": "string optional",
+  "required_slots": ["APPOINTMENT_TARGET|HOME_ADDRESS|CLIENT_INFO_QUESTION|DELEGATION_OBJECTIVE"] optional,
+  "response_style": "CONCISE|STEP_BY_STEP optional"
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                `Requested appointmentId: ${input.requestedAppointmentId || 'none'}`,
+                pendingSummary,
+                `Recent assistant history:\n${compactAssistantHistory(input.assistantState.history, 10)}`,
+                `Appointment snapshot:\n${summarizeAppointmentsForPlanner(input.appointments, 8)}`,
+                `Latest caregiver message: ${input.command}`,
+              ].join('\n\n'),
+            },
+          ],
+        }),
+      });
+
+      if (!response.ok) return null;
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return null;
+      const parsed = tryParseJsonObject(raw);
+      let decision = normalizeAssistantPlannerDecision(parsed);
+      if (!decision) {
+        decision = await repairPlannerDecisionWithLLM({
+          rawContent: raw,
+          allowFollowUp: false,
+        });
+      }
+      if (!decision) return null;
+      if (decision.action !== 'USE_TOOL') return applyRouterContractDefaults({ action: 'RESPOND' });
+      if (!decision.tool) return null;
+      return applyRouterContractDefaults(decision);
+    } catch {
+      return null;
+    }
   }
 
   async function generateAssistantDirectResponseWithLLM(input: {
@@ -756,7 +1854,7 @@ Output schema:
             {
               role: 'system',
               content:
-                'You are a caregiver personal assistant. Respond naturally, directly, and helpfully like a normal assistant, while staying grounded in caregiver workflow context. For non-tool questions, give a direct answer. For logistics that require data/tooling, ask a concise follow-up or suggest the next concrete action. Do not invent real-time data access you do not have.',
+                'You are a caregiver personal assistant in conversational fallback mode. Respond naturally, directly, and helpfully while staying grounded in caregiver workflow context. Give direct answers for non-tool questions. If data or actions require tools/system calls, state that limitation clearly and suggest the next concrete step. Do not invent real-time data access. In this mode, do not claim that you already executed actions (for example sending messages, starting delegation, fetching maps, or querying records). Do not mention internal execution steps or ask the caregiver what command to run.',
             },
             {
               role: 'user',
@@ -798,37 +1896,72 @@ Output schema:
     });
   }
 
-  function extractKeyPoints(messages: Array<{ sender_type: string; content: string }>): string[] {
-    const points: string[] = [];
-    const seen = new Set<string>();
-
-    const patterns: Array<{ label: string; re: RegExp }> = [
-      { label: 'Access update', re: /\b(access|entry|gate|code|key|unlock|locked out)\b/i },
-      { label: 'Supplies/materials update', re: /\b(med|medication|supply|supplies|equipment|material|forms|documents)\b/i },
-      { label: 'Plan/scope update', re: /\b(plan|instruction|scope|update|changed)\b/i },
-      { label: 'Blocker/risk', re: /\b(cannot|cant|can\'t|blocked|delay|missing|issue|problem|not ready|no )\b/i },
-      { label: 'ETA/schedule', re: /\b(eta|arrive|arrival|late|time|schedule)\b/i },
-    ];
-
-    for (const m of messages) {
-      const content = String(m.content || '').trim();
-      if (!content) continue;
-
-      for (const p of patterns) {
-        if (p.re.test(content)) {
-          const line = `${p.label}: [${m.sender_type}] ${content.slice(0, 180)}`;
-          const key = normalizeKeyPoint(line);
-          if (!seen.has(key)) {
-            seen.add(key);
-            points.push(line);
-          }
-          break;
-        }
-      }
-      if (points.length >= 8) break;
+  async function extractKeyPointsWithLLM(
+    messages: Array<{ sender_type: string; content: string }>,
+  ): Promise<string[]> {
+    const normalized = messages
+      .map((m) => ({
+        senderType: String(m.sender_type || '').trim(),
+        content: String(m.content || '').trim(),
+      }))
+      .filter((m) => m.content.length > 0)
+      .slice(-20);
+    if (normalized.length === 0) return [];
+    if (!config.openai.apiKey) {
+      return normalized.slice(-5).map((m) => `[${m.senderType}] ${compactSnippet(m.content, 180)}`);
     }
 
-    return points;
+    try {
+      const transcript = normalized
+        .map((m, idx) => `${idx + 1}. [${m.senderType}] ${compactSnippet(m.content, 200)}`)
+        .join('\n');
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Extract up to 8 concise logistics-relevant key points from the conversation.
+Each key point should preserve concrete facts and speaker context.
+Avoid generic restatements.
+Ignore pure acknowledgements ("ok", "thanks") and avoid duplicate phrasing.
+Prefer concrete updates that change caregiver decisions (access, timing, meds/supplies, safety, care-plan changes).
+
+Return:
+{
+  "points": ["string"]
+}`,
+            },
+            {
+              role: 'user',
+              content: `Conversation lines:\n${transcript}`,
+            },
+          ],
+        }),
+      });
+      if (!response.ok) return normalized.slice(-5).map((m) => `[${m.senderType}] ${compactSnippet(m.content, 180)}`);
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return normalized.slice(-5).map((m) => `[${m.senderType}] ${compactSnippet(m.content, 180)}`);
+      const parsed = JSON.parse(raw) as { points?: unknown };
+      const points = Array.isArray(parsed?.points)
+        ? parsed.points.map((p) => String(p || '').trim()).filter(Boolean).slice(0, 8)
+        : [];
+      return points.length > 0
+        ? points
+        : normalized.slice(-5).map((m) => `[${m.senderType}] ${compactSnippet(m.content, 180)}`);
+    } catch {
+      return normalized.slice(-5).map((m) => `[${m.senderType}] ${compactSnippet(m.content, 180)}`);
+    }
   }
 
   function dedupeSummaries(items: DelegationSummaryRecord[]): DelegationSummaryRecord[] {
@@ -848,7 +1981,12 @@ Output schema:
     return out;
   }
 
-  async function buildDelegationSummary(appointmentId: string, startedAt: string, endedAt: string): Promise<string> {
+  async function buildDelegationSummary(
+    appointmentId: string,
+    startedAt: string,
+    endedAt: string,
+    context?: { objective?: string; questions?: string[] },
+  ): Promise<string> {
     const messagesRes = await pool.query(
       `
         SELECT sender_type, content, created_at
@@ -861,51 +1999,73 @@ Output schema:
       [appointmentId, startedAt, endedAt]
     );
 
-    const totalMessages = messagesRes.rows.length;
-    const aiMessages = messagesRes.rows.filter((m) => m.sender_type === 'AI_AGENT').length;
-    const clientMessages = messagesRes.rows.filter((m) => m.sender_type === 'FAMILY').length;
-    const systemMessages = messagesRes.rows.filter((m) => m.sender_type === 'SYSTEM').length;
-    const coordinatorMessages = messagesRes.rows.filter((m) => m.sender_type === 'COORDINATOR').length;
-
-    const highlights = messagesRes.rows
-      .filter((m) => m.sender_type !== 'SYSTEM')
-      .slice(-6)
-      .map((m) => `[${m.sender_type}] ${String(m.content).slice(0, 140)}`);
-
-    const keyPoints = extractKeyPoints(messagesRes.rows.map((m) => ({
+    const keyPoints = await extractKeyPointsWithLLM(messagesRes.rows.map((m) => ({
       sender_type: String(m.sender_type),
       content: String(m.content),
     })));
 
-    const qaPairs: string[] = [];
-    for (let i = 0; i < messagesRes.rows.length - 1; i += 1) {
-      const a = messagesRes.rows[i];
-      const b = messagesRes.rows[i + 1];
-      if (String(a.sender_type) === 'AI_AGENT' && (String(b.sender_type) === 'FAMILY' || String(b.sender_type) === 'COORDINATOR')) {
-        qaPairs.push(`Q: ${String(a.content).slice(0, 120)}\nA: ${String(b.content).slice(0, 120)}`);
-      }
-      if (qaPairs.length >= 4) break;
-    }
-
-    return [
-      `Delegation window: ${formatBusinessDateTime(startedAt)} to ${formatBusinessDateTime(endedAt)}.`,
-      `Traffic summary: ${totalMessages} total messages, ${aiMessages} AI responses, ${clientMessages} family messages, ${coordinatorMessages} coordinator messages, ${systemMessages} system events.`,
-      keyPoints.length > 0 ? `Key points:\n- ${keyPoints.join('\n- ')}` : 'Key points: none detected from conversation signals.',
-      qaPairs.length > 0 ? `Question/answer trace:\n- ${qaPairs.join('\n- ')}` : 'Question/answer trace: no direct Q/A pairs captured.',
-      highlights.length > 0 ? `Recent highlights:\n- ${highlights.join('\n- ')}` : 'Recent highlights: none.',
-    ].join('\n');
+    return buildCaregiverDelegationSummary({
+      startedAtLabel: formatBusinessDateTime(startedAt),
+      endedAtLabel: formatBusinessDateTime(endedAt),
+      objective: String(context?.objective || '').trim() || 'Collect logistics updates and keep client informed.',
+      requestedQuestions: Array.isArray(context?.questions) ? context?.questions.map(String) : [],
+      llmKeyPoints: keyPoints,
+      messages: messagesRes.rows.map((row) => ({
+        senderType: String(row.sender_type || ''),
+        content: String(row.content || ''),
+        createdAt: String(row.created_at || ''),
+      })),
+    });
   }
 
-  function looksLikeNonClientOwnedQuestion(text: string): boolean {
-    const v = text.toLowerCase();
-    return (
-      v.includes('caregiver') ||
-      v.includes('provider') ||
-      v.includes('our schedule') ||
-      v.includes('my schedule') ||
-      v.includes('dispatch') ||
-      v.includes('route')
-    );
+  async function pickFirstClientAskableQuestionIndexWithLLM(questions: string[]): Promise<number> {
+    if (questions.length === 0) return -1;
+    if (!config.openai.apiKey) return 0;
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Select the best first question to ask a client/family participant during delegation.
+Prefer questions that are directly answerable by the client and avoid questions that require internal care-team/provider-only knowledge.
+
+Return:
+{
+  "index": number
+}
+Index is zero-based. If no question is appropriate, return -1.`,
+            },
+            {
+              role: 'user',
+              content: questions.map((q, idx) => `${idx}: ${q}`).join('\n'),
+            },
+          ],
+        }),
+      });
+      if (!response.ok) return 0;
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return 0;
+      const parsed = JSON.parse(raw) as { index?: unknown };
+      const idx = Number(parsed?.index);
+      if (!Number.isInteger(idx)) return 0;
+      if (idx < 0 || idx >= questions.length) return -1;
+      return idx;
+    } catch {
+      return 0;
+    }
   }
 
   async function loadCaregiverAppointments(
@@ -959,9 +2119,46 @@ Output schema:
     const rawDuration = Number(input.durationMinutes);
     const duration = Number.isFinite(rawDuration) ? Math.max(5, Math.min(180, Math.trunc(rawDuration))) : 30;
     const forceStart = Boolean(input.forceStart);
-    const questions = Array.isArray(input.questions)
-      ? input.questions.map((q) => String(q).trim()).filter(Boolean)
+    const normalizeQuestionItem = (row: unknown): DelegationQuestionItem | null => {
+      if (!row || typeof row !== 'object') return null;
+      const item = row as Record<string, unknown>;
+      const text = String(item.text || '').trim();
+      if (!text) return null;
+      const priority = String(item.priority || '').trim().toUpperCase() === 'OPTIONAL' ? 'OPTIONAL' : 'PRIMARY';
+      return { text, priority };
+    };
+    const questionItemsRaw: DelegationQuestionItem[] = Array.isArray(input.questionItems)
+      ? input.questionItems
+          .map((row) => normalizeQuestionItem(row))
+          .filter((row): row is DelegationQuestionItem => Boolean(row))
       : [];
+    const fallbackQuestionItems = Array.isArray(input.questions)
+      ? input.questions
+          .map((q) => String(q || '').trim())
+          .filter(Boolean)
+          .map((text) => ({ text, priority: 'PRIMARY' as const }))
+      : [];
+    const questionItems =
+      questionItemsRaw.length > 0
+        ? questionItemsRaw
+        : fallbackQuestionItems.length > 0
+          ? fallbackQuestionItems
+          : [{ text: 'Can you help confirm the missing details needed before the visit?', priority: 'PRIMARY' as const }];
+    const questions = questionItems.map((item) => item.text);
+    const primaryQuestionIndexes = questionItems
+      .map((item, idx) => (item.priority === 'PRIMARY' ? idx : -1))
+      .filter((idx) => idx >= 0);
+    const safePrimaryQuestionIndexes =
+      primaryQuestionIndexes.length > 0 ? primaryQuestionIndexes : (questions.length > 0 ? [0] : []);
+    const optionalQuestionIndexes = questionItems
+      .map((item, idx) => (item.priority === 'OPTIONAL' ? idx : -1))
+      .filter((idx) => idx >= 0);
+    const delegationTypeRaw =
+      String(input.delegationType || input.contextPacket?.delegationType || '').trim().toUpperCase();
+    const delegationType: DelegationType =
+      delegationTypeRaw === 'FACT_CHECK' || delegationTypeRaw === 'LOGISTICS' || delegationTypeRaw === 'OPEN_ENDED'
+        ? (delegationTypeRaw as DelegationType)
+        : inferDelegationTypeFromCommand(`${objective} ${questions.join(' ')}`.trim());
 
     const apptRes = await pool.query(
       `
@@ -1011,7 +2208,21 @@ Output schema:
       active: true,
       objective,
       questions,
+      questionItems,
+      primaryQuestionIndexes: safePrimaryQuestionIndexes,
+      optionalQuestionIndexes,
+      delegationType,
+      factCheckClarificationAsked: false,
       askedQuestionIndexes: [],
+      resolvedQuestionIndexes: [],
+      progressNotifiedIndexes: [],
+      completionNotifiedAt: undefined,
+      contextPacket: {
+        ...(input.contextPacket || {}),
+        delegationType,
+        primaryQuestionCount: safePrimaryQuestionIndexes.length,
+        optionalQuestionCount: optionalQuestionIndexes.length,
+      },
       startedAt: now.toISOString(),
       endsAt: endsAt.toISOString(),
     };
@@ -1019,15 +2230,35 @@ Output schema:
     settings.delegations = delegations;
     await saveAgentSettings(input.userId, role || 'CAREGIVER', settings, { activateAgent: true });
 
-    const firstValidQuestionIndex = delegations[appointmentId].questions.findIndex(
-      (q) => !looksLikeNonClientOwnedQuestion(q),
-    );
-    const firstQuestion =
-      firstValidQuestionIndex >= 0 ? delegations[appointmentId].questions[firstValidQuestionIndex] : null;
+    let firstValidQuestionIndex = -1;
+    let kickoffAskedIndexes: number[] = [];
+    if (delegationType === 'FACT_CHECK') {
+      kickoffAskedIndexes = safePrimaryQuestionIndexes.slice(0, 2);
+      firstValidQuestionIndex = kickoffAskedIndexes[0] ?? -1;
+    } else {
+      const primaryQuestions = safePrimaryQuestionIndexes.map((idx) => questions[idx]).filter(Boolean);
+      const firstPrimaryRelative = await pickFirstClientAskableQuestionIndexWithLLM(primaryQuestions);
+      if (firstPrimaryRelative >= 0 && firstPrimaryRelative < safePrimaryQuestionIndexes.length) {
+        firstValidQuestionIndex = safePrimaryQuestionIndexes[firstPrimaryRelative];
+      } else {
+        firstValidQuestionIndex = await pickFirstClientAskableQuestionIndexWithLLM(questions);
+      }
+      if (firstValidQuestionIndex >= 0) {
+        kickoffAskedIndexes = [firstValidQuestionIndex];
+      }
+    }
+    const firstQuestion = firstValidQuestionIndex >= 0 ? questions[firstValidQuestionIndex] : null;
 
-    const kickoffMessage = firstQuestion
-      ? `Hi, I am assisting your caregiver right now. Quick first question: ${firstQuestion}`
-      : `Hi, I am assisting your caregiver right now. I will keep you updated and help coordinate logistics.`;
+    const kickoffMessage =
+      delegationType === 'FACT_CHECK' && kickoffAskedIndexes.length > 1
+        ? [
+            'Hi, I am assisting your caregiver right now. Quick questions:',
+            ...kickoffAskedIndexes.map((idx, offset) => `${offset + 1}) ${questions[idx]}`),
+            'Please answer what you know.',
+          ].join('\n')
+        : firstQuestion
+          ? `Hi, I am assisting your caregiver right now. Quick first question: ${firstQuestion}`
+          : `Hi, I am assisting your caregiver right now. I will keep you updated and help coordinate logistics.`;
 
     await pool.query(
       `
@@ -1037,8 +2268,8 @@ Output schema:
       [appointmentId, input.userId, kickoffMessage],
     );
 
-    if (firstValidQuestionIndex >= 0) {
-      delegations[appointmentId].askedQuestionIndexes = [firstValidQuestionIndex];
+    if (kickoffAskedIndexes.length > 0) {
+      delegations[appointmentId].askedQuestionIndexes = kickoffAskedIndexes.slice().sort((a, b) => a - b);
       settings.delegations = delegations;
       await saveAgentSettings(input.userId, role || 'CAREGIVER', settings, { activateAgent: true });
     }
@@ -1056,114 +2287,6 @@ Output schema:
       .replace(/[^a-z0-9\s]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-  }
-
-  function includesAnyTerm(value: string, terms: string[]): boolean {
-    return terms.some((term) => value.includes(term));
-  }
-
-  function looksLikeQuestionCommand(command: string): boolean {
-    if (String(command || '').includes('?')) return true;
-    return /^(what|when|where|who|which|did|does|do|is|are|was|were|can|could|has|have|tell me|remind me|give me)\b/i.test(
-      String(command || '').trim(),
-    );
-  }
-
-  function detectAgentCommandIntent(command: string): AgentCommandIntent {
-    const normalized = normalizeCommandText(command);
-
-    const delegationDirective = includesAnyTerm(normalized, [
-      'start delegation',
-      'start delegating',
-      'delegate this',
-      'start checking',
-      'check whether',
-      'can you check',
-      'please check',
-      'follow up',
-      'reach out',
-      'ask them',
-      'confirm with',
-      'verify with',
-      'find out',
-    ]);
-
-    const delegationVerbPair =
-      includesAnyTerm(normalized, ['start', 'begin', 'delegate']) &&
-      includesAnyTerm(normalized, ['check', 'ask', 'follow', 'reach', 'confirm', 'verify', 'collect']);
-
-    const hasScheduleNoun = includesAnyTerm(normalized, [
-      'schedule',
-      'appointment',
-      'appointments',
-      'visit',
-      'visits',
-    ]);
-    const hasScheduleAsk = includesAnyTerm(normalized, [
-      'today',
-      'day',
-      'between',
-      'gap',
-      'gaps',
-      'next',
-      'time between',
-      'how much time',
-      'free time',
-      'break',
-    ]);
-    const scheduleIntent = hasScheduleNoun && hasScheduleAsk;
-    const mapsIntent =
-      includesAnyTerm(normalized, [
-        'route',
-        'map',
-        'maps',
-        'travel',
-        'drive',
-        'driving',
-        'distance',
-        'directions',
-        'traffic',
-        'eta',
-        'commute',
-        'home',
-        'house',
-      ]) &&
-      includesAnyTerm(normalized, [
-        'today',
-        'day',
-        'between',
-        'next',
-        'first',
-        'last',
-        'to',
-        'from',
-        'plan',
-        'how long',
-        'time',
-        'appointment',
-        'appointments',
-        'visit',
-        'visits',
-      ]);
-
-    const accessCodeIntent =
-      (includesAnyTerm(normalized, ['access code', 'entry code', 'gate code', 'door code']) ||
-        (normalized.includes('code') && includesAnyTerm(normalized, ['access', 'entry', 'gate', 'door']))) &&
-      !delegationDirective &&
-      !delegationVerbPair;
-    const clientInfoIntent =
-      looksLikeQuestionCommand(command) &&
-      !scheduleIntent &&
-      !accessCodeIntent &&
-      !delegationDirective &&
-      !delegationVerbPair;
-
-    if (mapsIntent) return 'MAPS_ROUTE';
-    if (scheduleIntent) return 'SCHEDULE_OVERVIEW';
-    if (accessCodeIntent) return 'LOOKUP_ACCESS_CODE';
-    if (delegationDirective || delegationVerbPair) return 'START_DELEGATION';
-    if (clientInfoIntent) return 'CLIENT_INFO_LOOKUP';
-    return 'UNKNOWN';
   }
 
   function extractClientHint(command: string): string | null {
@@ -1190,7 +2313,11 @@ Output schema:
     for (const token of hintTokens) {
       if (clientTokens.has(token)) overlap += 1;
     }
-    return overlap * 20;
+    const denominator = Math.max(clientTokens.size, hintTokens.length);
+    if (denominator <= 0) return 0;
+    const overlapRatio = overlap / denominator;
+    if (overlapRatio >= 0.99) return 95;
+    return Math.round(overlapRatio * 80);
   }
 
   function getBusinessDateFromTimestamp(value: string): string | null {
@@ -1302,6 +2429,192 @@ Output schema:
     return target;
   }
 
+  async function extractExplicitClientReferenceWithLLM(command: string): Promise<string | null> {
+    if (!config.openai.apiKey) return null;
+    const text = String(command || '').trim();
+    if (!text) return null;
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Extract the explicitly referenced client/person name from the caregiver message.
+If no specific person/client is referenced, return null.
+
+Return:
+{
+  "clientReference": "string|null"
+}`,
+            },
+            {
+              role: 'user',
+              content: `Caregiver message: ${text}`,
+            },
+          ],
+        }),
+      });
+      if (!response.ok) return null;
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return null;
+      const parsed = tryParseJsonObject(raw) as { clientReference?: unknown } | null;
+      if (!parsed) return null;
+      const ref = parsed.clientReference;
+      if (ref === null || ref === undefined) return null;
+      const normalized = String(ref).trim();
+      return normalized || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolveAppointmentWithLLM(input: {
+    appointments: CaregiverAppointmentRow[];
+    command: string;
+    requestedAppointmentId?: string;
+    memory?: AssistantMemoryState;
+  }): Promise<{ appointment: CaregiverAppointmentRow | null; explicitContext: boolean } | null> {
+    if (!config.openai.apiKey || input.appointments.length === 0) {
+      return null;
+    }
+
+    const appointmentSummary = input.appointments
+      .slice(0, 60)
+      .map(
+        (row, idx) =>
+          `${idx + 1}. appointmentId=${row.appointmentId}, client=${row.clientName}, start=${formatBusinessDateTime(row.startTime)}, status=${row.appointmentStatus}`,
+      )
+      .join('\n');
+    const clientRoster = Array.from(
+      new Set(
+        input.appointments
+          .map((row) => String(row.clientName || '').trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, 40);
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Choose the best matching appointment for the caregiver command from the provided list.
+If command does not reference a specific visit/client/date, choose null.
+Also classify whether the command contains explicit appointment context.
+If command explicitly names or points to a client/visit that is not present in the list, choose null.
+Do not force a low-confidence match.
+
+Return:
+{
+  "appointmentId": "string|null",
+  "explicitContext": true|false
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                `Requested appointmentId: ${input.requestedAppointmentId || 'none'}`,
+                `Memory appointmentId: ${input.memory?.appointmentId || 'none'}`,
+                `Memory clientName: ${input.memory?.clientName || 'none'}`,
+                `Command: ${input.command}`,
+                `Client roster:\n${clientRoster.join('\n') || '(none)'}`,
+                `Appointments:\n${appointmentSummary}`,
+              ].join('\n\n'),
+            },
+          ],
+        }),
+      });
+
+      if (!response.ok) return null;
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { appointmentId?: unknown; explicitContext?: unknown };
+      const appointmentIdRaw = parsed?.appointmentId;
+      const appointmentId =
+        appointmentIdRaw === null || appointmentIdRaw === undefined
+          ? null
+          : String(appointmentIdRaw).trim() || null;
+      let appointment = appointmentId
+        ? input.appointments.find((row) => row.appointmentId === appointmentId) || null
+        : null;
+      const explicitContext = Boolean(parsed?.explicitContext);
+      if (explicitContext) {
+        const explicitClientReference = await extractExplicitClientReferenceWithLLM(input.command);
+        if (explicitClientReference) {
+          const matches = input.appointments
+            .map((row) => ({
+              row,
+              score: scoreClientNameMatch(row.clientName, explicitClientReference),
+            }))
+            .filter((entry) => entry.score >= 60)
+            .sort((a, b) => b.score - a.score);
+          if (matches.length === 0) {
+            appointment = null;
+          } else if (!appointment || scoreClientNameMatch(appointment.clientName, explicitClientReference) < 60) {
+            appointment = matches[0].row;
+          }
+        }
+      }
+      return {
+        appointment,
+        explicitContext,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function hasExplicitAppointmentContext(input: {
+    command: string;
+    appointments: CaregiverAppointmentRow[];
+    requestedAppointmentId?: string;
+  }): boolean {
+    if (String(input.requestedAppointmentId || '').trim()) return true;
+    if (Boolean(parseBusinessDateHint(input.command))) return true;
+    if (Boolean(extractClientHint(input.command))) return true;
+    if (Boolean(extractClientHintFromKnownAppointments(input.command, input.appointments))) return true;
+    return false;
+  }
+
+  function appendInferredContextDisclosure(
+    response: string,
+    input: {
+      inferred: boolean;
+      appointment: CaregiverAppointmentRow | null;
+    },
+  ): string {
+    const base = String(response || '').trim();
+    if (!input.inferred || !input.appointment) return base;
+    const disclosure = `Using context: ${input.appointment.clientName} on ${formatBusinessDateTime(input.appointment.startTime)}.`;
+    if (!base) return disclosure;
+    if (base.toLowerCase().includes('using context:')) return base;
+    return `${base}\n\n${disclosure}`;
+  }
+
   function getCurrentBusinessDateIso(): string {
     return new Intl.DateTimeFormat('en-CA', {
       timeZone: BUSINESS_TIME_ZONE,
@@ -1309,6 +2622,10 @@ Output schema:
       month: '2-digit',
       day: '2-digit',
     }).format(new Date());
+  }
+
+  function formatBusinessDateLabel(dateIso: string): string {
+    return formatBusinessDateLabelPolicy(dateIso, BUSINESS_TIME_ZONE);
   }
 
   function formatBusinessTime(value: string): string {
@@ -1330,51 +2647,15 @@ Output schema:
     return `${remainder}m`;
   }
 
-  function buildScheduleOverviewResponse(appointments: CaregiverAppointmentRow[]): string {
-    const dateLabel = new Date().toLocaleDateString('en-US', {
+  function buildScheduleOverviewResponse(
+    appointments: CaregiverAppointmentRow[],
+    businessDate: string,
+  ): string {
+    return buildScheduleOverviewResponsePolicy(appointments, businessDate, {
       timeZone: BUSINESS_TIME_ZONE,
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
+      currentBusinessDateIso: getCurrentBusinessDateIso(),
+      nowMs: Date.now(),
     });
-    if (appointments.length === 0) {
-      return `No caregiver visits are scheduled for ${dateLabel}.`;
-    }
-
-    const lines = appointments.map(
-      (row, idx) =>
-        `${idx + 1}. ${formatBusinessTime(row.startTime)}-${formatBusinessTime(row.endTime)} • ${row.clientName}`,
-    );
-
-    const gaps: string[] = [];
-    for (let i = 0; i < appointments.length - 1; i += 1) {
-      const currentEnd = new Date(appointments[i].endTime).getTime();
-      const nextStart = new Date(appointments[i + 1].startTime).getTime();
-      if (!Number.isFinite(currentEnd) || !Number.isFinite(nextStart)) continue;
-      const gapMinutes = Math.max(0, Math.round((nextStart - currentEnd) / 60000));
-      gaps.push(
-        `${formatDurationMinutes(gapMinutes)} between ${appointments[i].clientName} and ${appointments[i + 1].clientName}`,
-      );
-    }
-
-    const nowMs = Date.now();
-    const nextAppointment = appointments.find((item) => new Date(item.startTime).getTime() >= nowMs);
-    const nextLine = nextAppointment
-      ? `Next visit: ${nextAppointment.clientName} at ${formatBusinessTime(nextAppointment.startTime)}.`
-      : 'All visits for today are already in the past.';
-    const gapLine =
-      gaps.length > 0
-        ? `Gaps: ${gaps.join(' | ')}.`
-        : appointments.length > 1
-        ? 'Gaps: No break time between consecutive visits.'
-        : 'Gaps: Single-visit day.';
-
-    return [
-      `${appointments.length} visit${appointments.length === 1 ? '' : 's'} on ${dateLabel}.`,
-      nextLine,
-      lines.join('\n'),
-      gapLine,
-    ].join('\n');
   }
 
   function cleanAddress(value: string | null | undefined): string {
@@ -1387,29 +2668,6 @@ Output schema:
       return Math.floor(Date.now() / 1000);
     }
     return Math.max(Math.floor(Date.now() / 1000), Math.floor(parsed / 1000));
-  }
-
-  function shouldPlanReturnHome(command: string): boolean {
-    const normalized = normalizeCommandText(command);
-    return includesAnyTerm(normalized, [
-      'return home',
-      'back home',
-      'to home',
-      'to my home',
-      'to my house',
-      'end at home',
-      'finish at home',
-    ]);
-  }
-
-  function wantsHomeEstimate(command: string): boolean {
-    const normalized = normalizeCommandText(command);
-    return includesAnyTerm(normalized, ['home', 'house']);
-  }
-
-  function wantsToHome(command: string): boolean {
-    const normalized = normalizeCommandText(command);
-    return includesAnyTerm(normalized, ['to home', 'to my home', 'to my house', 'back home', 'return home']);
   }
 
   function buildMapLegLabel(appointment: CaregiverAppointmentRow): string {
@@ -1489,9 +2747,99 @@ Output schema:
     return `${miles.toFixed(miles < 10 ? 1 : 0)} mi`;
   }
 
+  type MapsPlanMode =
+    | 'DAY_ROUTE'
+    | 'BETWEEN_VISITS'
+    | 'DAY_ROUTE_RETURN_HOME'
+    | 'HOME_TO_CLIENT'
+    | 'CLIENT_TO_HOME';
+
+  async function interpretMapsPlanModeWithLLM(input: {
+    command: string;
+    businessDate: string;
+    homeAddressKnown: boolean;
+    hasTargetAppointment: boolean;
+    appointments: CaregiverAppointmentRow[];
+  }): Promise<MapsPlanMode> {
+    if (!config.openai.apiKey) {
+      return 'DAY_ROUTE';
+    }
+
+    const appointmentSummary = input.appointments
+      .slice(0, 8)
+      .map(
+        (row, idx) =>
+          `${idx + 1}. ${row.clientName} at ${formatBusinessTime(row.startTime)}-${formatBusinessTime(row.endTime)} (${row.locationAddress || 'no address'})`,
+      )
+      .join('\n');
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.openai.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openai.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `Return JSON only.
+
+Classify the caregiver maps request into one mode:
+- DAY_ROUTE: overall route plan for the day.
+- BETWEEN_VISITS: only travel legs between appointments.
+- DAY_ROUTE_RETURN_HOME: day route including return home at end.
+- HOME_TO_CLIENT: one-leg route from home to a target client visit.
+- CLIENT_TO_HOME: one-leg route from target client visit back home.
+
+Use semantics and available context, not keyword lists.
+
+Return:
+{
+  "mode": "DAY_ROUTE|BETWEEN_VISITS|DAY_ROUTE_RETURN_HOME|HOME_TO_CLIENT|CLIENT_TO_HOME"
+}`,
+            },
+            {
+              role: 'user',
+              content: [
+                `Home address known: ${input.homeAddressKnown ? 'yes' : 'no'}`,
+                `Target appointment resolved: ${input.hasTargetAppointment ? 'yes' : 'no'}`,
+                `Appointments on ${formatBusinessDateLabel(input.businessDate)}:`,
+                appointmentSummary || '(none)',
+                '',
+                `Caregiver request: ${input.command}`,
+              ].join('\n'),
+            },
+          ],
+        }),
+      });
+      if (!response.ok) return 'DAY_ROUTE';
+      const payload = (await response.json()) as any;
+      const raw = String(payload?.choices?.[0]?.message?.content || '').trim();
+      if (!raw) return 'DAY_ROUTE';
+      const parsed = JSON.parse(raw) as { mode?: unknown };
+      const mode = String(parsed?.mode || '').trim().toUpperCase();
+      const valid = new Set<MapsPlanMode>([
+        'DAY_ROUTE',
+        'BETWEEN_VISITS',
+        'DAY_ROUTE_RETURN_HOME',
+        'HOME_TO_CLIENT',
+        'CLIENT_TO_HOME',
+      ]);
+      return valid.has(mode as MapsPlanMode) ? (mode as MapsPlanMode) : 'DAY_ROUTE';
+    } catch {
+      return 'DAY_ROUTE';
+    }
+  }
+
   async function buildMapsDayPlan(input: {
     userId: string;
     command: string;
+    businessDate?: string;
     requestedAppointmentId?: string;
     homeAddressOverride?: string;
   }): Promise<{
@@ -1505,25 +2853,36 @@ Output schema:
       appointmentStartTime: string;
     };
   }> {
-    const businessDate = getCurrentBusinessDateIso();
-    const todayAppointments = (await loadCaregiverAppointments(input.userId, { businessDate })).filter(
+    const businessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(input.businessDate || ''))
+      ? String(input.businessDate)
+      : getCurrentBusinessDateIso();
+    const dateLabel = formatBusinessDateLabel(businessDate);
+    const dayAppointments = (await loadCaregiverAppointments(input.userId, { businessDate })).filter(
       (row) => row.appointmentStatus !== 'CANCELLED',
     );
 
-    if (todayAppointments.length === 0) {
+    if (dayAppointments.length === 0) {
       return {
-        response: 'No visits are scheduled today, so there is no route to calculate.',
+        response: `No visits are scheduled on ${dateLabel}, so there is no route to calculate.`,
         legs: [],
         resolvedAppointment: null,
       };
     }
 
-    const normalizedCommand = normalizeCommandText(input.command);
-    const targetAppointment = pickAppointmentForCommand(
-      todayAppointments,
-      input.command,
-      input.requestedAppointmentId,
-    );
+    const llmResolvedTarget = await resolveAppointmentWithLLM({
+      appointments: dayAppointments,
+      command: input.command,
+      requestedAppointmentId: input.requestedAppointmentId,
+    });
+    const targetAppointment =
+      llmResolvedTarget?.appointment ||
+      (llmResolvedTarget?.explicitContext
+        ? null
+        : pickAppointmentForCommand(
+            dayAppointments,
+            input.command,
+            input.requestedAppointmentId,
+          ));
     const resolvedAppointment = targetAppointment
       ? {
           appointmentId: targetAppointment.appointmentId,
@@ -1534,12 +2893,21 @@ Output schema:
       : null;
 
     const homeAddress = cleanAddress(input.homeAddressOverride) || (await loadCaregiverHomeAddress(input.userId)) || '';
-    const commandWantsHome = wantsHomeEstimate(input.command);
-    const commandToHome = wantsToHome(input.command);
-    const includeReturnHome = shouldPlanReturnHome(input.command);
-    const betweenOnly = includesAnyTerm(normalizedCommand, ['between appointments', 'between visits', 'between']);
+    const mapsMode = await interpretMapsPlanModeWithLLM({
+      command: input.command,
+      businessDate,
+      homeAddressKnown: Boolean(homeAddress),
+      hasTargetAppointment: Boolean(targetAppointment),
+      appointments: dayAppointments,
+    });
+    const needsHomeLeg =
+      mapsMode === 'HOME_TO_CLIENT' ||
+      mapsMode === 'CLIENT_TO_HOME' ||
+      mapsMode === 'DAY_ROUTE_RETURN_HOME';
+    const betweenOnly = mapsMode === 'BETWEEN_VISITS';
+    const includeReturnHome = mapsMode === 'DAY_ROUTE_RETURN_HOME';
 
-    if (commandWantsHome && !homeAddress) {
+    if (needsHomeLeg && !homeAddress) {
       return {
         response: 'What is your home address so I can calculate that route?',
         legs: [],
@@ -1548,7 +2916,7 @@ Output schema:
       };
     }
 
-    if (commandWantsHome && targetAppointment) {
+    if ((mapsMode === 'HOME_TO_CLIENT' || mapsMode === 'CLIENT_TO_HOME') && targetAppointment) {
       const appointmentAddress = cleanAddress(targetAppointment.locationAddress);
       if (!appointmentAddress) {
         return {
@@ -1559,11 +2927,14 @@ Output schema:
       }
 
       const leg = await estimateDriveLegWithGoogleMaps({
-        origin: commandToHome ? appointmentAddress : homeAddress,
-        destination: commandToHome ? homeAddress : appointmentAddress,
-        departureTime: commandToHome ? targetAppointment.endTime : new Date().toISOString(),
+        origin: mapsMode === 'CLIENT_TO_HOME' ? appointmentAddress : homeAddress,
+        destination: mapsMode === 'CLIENT_TO_HOME' ? homeAddress : appointmentAddress,
+        departureTime: mapsMode === 'CLIENT_TO_HOME' ? targetAppointment.endTime : targetAppointment.startTime,
       });
-      const directionLabel = commandToHome ? `${targetAppointment.clientName} -> home` : `home -> ${targetAppointment.clientName}`;
+      const directionLabel =
+        mapsMode === 'CLIENT_TO_HOME'
+          ? `${targetAppointment.clientName} -> home`
+          : `home -> ${targetAppointment.clientName}`;
       return {
         response: [
           `Estimated drive ${directionLabel}: ${formatDurationMinutes(leg.durationMinutes)} (${formatMilesFromMeters(leg.distanceMeters)}).`,
@@ -1575,10 +2946,10 @@ Output schema:
       };
     }
 
-    const routeAppointments = todayAppointments.filter((row) => cleanAddress(row.locationAddress));
+    const routeAppointments = dayAppointments.filter((row) => cleanAddress(row.locationAddress));
     if (routeAppointments.length === 0) {
       return {
-        response: 'Today’s appointments are missing location addresses, so I cannot calculate map travel times.',
+        response: `Appointments on ${dateLabel} are missing location addresses, so I cannot calculate map travel times.`,
         legs: [],
         resolvedAppointment,
       };
@@ -1589,7 +2960,7 @@ Output schema:
       legRequests.push({
         origin: homeAddress,
         destination: cleanAddress(routeAppointments[0].locationAddress),
-        departureTime: new Date().toISOString(),
+        departureTime: routeAppointments[0].startTime,
         label: `home -> ${buildMapLegLabel(routeAppointments[0])}`,
       });
     }
@@ -1637,7 +3008,7 @@ Output schema:
 
     return {
       response: [
-        `Estimated drive plan for today (${routeAppointments.length} visit${routeAppointments.length === 1 ? '' : 's'}):`,
+        `Estimated drive plan for ${dateLabel} (${routeAppointments.length} visit${routeAppointments.length === 1 ? '' : 's'}):`,
         lines.join('\n'),
         `Total estimated drive time: ${formatDurationMinutes(totalMinutes)}.`,
         'Source: Google Maps Distance Matrix.',
@@ -1649,94 +3020,35 @@ Output schema:
 
   function deriveDelegationPlan(command: string): { objective: string; questions: string[] } {
     const trimmed = String(command || '').trim();
-    const simplified = trimmed
-      .replace(/^\s*(can you|could you|please|i want you to|i need you to|agent[:,]?)\s*/i, '')
-      .replace(/[?.!]+$/g, '')
-      .trim();
+    const objective = trimmed
+      ? trimmed.length > 220
+        ? `${trimmed.slice(0, 217)}...`
+        : trimmed
+      : 'Collect the missing caregiver-requested details from client or family.';
+    const question = trimmed
+      ? `Can you help confirm this request: ${trimmed.slice(0, 140)}${trimmed.length > 140 ? '...' : ''}?`
+      : 'Can you help confirm the missing details needed before this visit?';
+    return {
+      objective,
+      questions: [question],
+    };
+  }
 
-    const objective = simplified
-      ? simplified.length > 220
-        ? `${simplified.slice(0, 217)}...`
-        : simplified
-      : 'Collect logistics updates and keep the client informed.';
-
-    const whetherMatch = simplified.match(/\bwhether\s+(.+)$/i);
-    const actionMatch = simplified.match(/\b(?:check|confirm|verify|ask|find out|follow up(?: on)?|reach out(?: to)?)\s+(.+)$/i);
-    let focus = String(whetherMatch?.[1] || actionMatch?.[1] || '').replace(/[?.!]+$/g, '').trim();
-    if (!focus) {
-      focus = 'there are any logistics updates before the visit';
-    }
-
-    const question =
-      focus.toLowerCase().startsWith('if ') || focus.toLowerCase().startsWith('whether ')
-        ? `Can you confirm ${focus}?`
-        : `Can you confirm if ${focus}?`;
-
-    return { objective, questions: [question] };
+  function toDelegationContextHistoryLines(history: AssistantTurn[]): DelegationContextHistoryLine[] {
+    return (history || [])
+      .slice(-16)
+      .map((turn) => ({
+        role: turn.role,
+        content: String(turn.content || '').trim(),
+        createdAt: turn.createdAt,
+      }))
+      .filter((row) => row.content.length > 0);
   }
 
   function compactSnippet(text: string, limit = 180): string {
     const compact = String(text || '').replace(/\s+/g, ' ').trim();
     if (compact.length <= limit) return compact;
     return `${compact.slice(0, limit - 1)}...`;
-  }
-
-  function extractAccessCodeToken(content: string): string | null {
-    const patterns: RegExp[] = [
-      /\b(?:access|entry|gate|door)\s*code\s*(?:is|=|:|-)\s*([a-z0-9#*\-]{3,12})\b/i,
-      /\bcode\s*(?:is|=|:|-)\s*([a-z0-9#*\-]{3,12})\b/i,
-      /\b(?:gate|entry|door)\s*(?:is|=|:|-)\s*([a-z0-9#*\-]{3,12})\b/i,
-    ];
-
-    for (const pattern of patterns) {
-      const match = content.match(pattern);
-      if (!match?.[1]) continue;
-      const candidate = String(match[1]).replace(/[.,;!?]+$/g, '').trim();
-      if (/^[a-z0-9#*\-]{3,12}$/i.test(candidate)) {
-        return candidate;
-      }
-    }
-    return null;
-  }
-
-  async function lookupAccessCodeEvidence(appointmentId: string): Promise<{
-    code: string | null;
-    senderType: string | null;
-    createdAt: string | null;
-    snippet: string | null;
-  }> {
-    const messagesRes = await pool.query(
-      `
-        SELECT sender_type, content, created_at::text AS created_at
-        FROM messages
-        WHERE appointment_id = $1::uuid
-          AND content ~* '(access|entry|gate|door|code|key)'
-        ORDER BY created_at DESC
-        LIMIT 50
-      `,
-      [appointmentId],
-    );
-
-    for (const row of messagesRes.rows) {
-      const content = String(row.content || '');
-      const token = extractAccessCodeToken(content);
-      if (!token) continue;
-      return {
-        code: token,
-        senderType: String(row.sender_type || ''),
-        createdAt: String(row.created_at || ''),
-        snippet: compactSnippet(content),
-      };
-    }
-
-    const latestHumanMessage =
-      messagesRes.rows.find((row) => String(row.sender_type || '') !== 'AI_AGENT') || messagesRes.rows[0];
-    return {
-      code: null,
-      senderType: latestHumanMessage ? String(latestHumanMessage.sender_type || '') : null,
-      createdAt: latestHumanMessage ? String(latestHumanMessage.created_at || '') : null,
-      snippet: latestHumanMessage ? compactSnippet(String(latestHumanMessage.content || '')) : null,
-    };
   }
 
   function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
@@ -1767,66 +3079,37 @@ Output schema:
     });
   }
 
-  function extractLookupKeywords(question: string, clientName?: string): string[] {
-    const normalizedQuestion = normalizeCommandText(question);
-    const clientTokens = new Set(normalizeCommandText(String(clientName || '')).split(' ').filter(Boolean));
-    const tokens = normalizedQuestion
-      .split(' ')
-      .map((token) => token.trim())
-      .filter(
-        (token) =>
-          token.length >= 3 &&
-          !LOOKUP_STOP_WORDS.has(token) &&
-          !clientTokens.has(token),
-      );
-    return Array.from(new Set(tokens)).slice(0, 10);
-  }
-
-  function extractPhoneToken(content: string): string | null {
-    const match = String(content || '').match(
-      /\b(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b/,
-    );
-    return match ? match[0].trim() : null;
-  }
-
-  function scoreMessageForKeywords(content: string, keywords: string[]): number {
-    const normalized = normalizeCommandText(content);
-    if (!normalized) return 0;
-    if (keywords.length === 0) return 1;
-
-    let score = 0;
-    for (const keyword of keywords) {
-      if (normalized.includes(keyword)) {
-        score += 2;
-      }
-    }
-    return score;
-  }
-
   function fallbackSelectEvidenceRows(
     evidenceRows: ClientMessageEvidenceRow[],
-    question: string,
-    clientName: string,
     snippetLimit: number,
   ): ClientMessageEvidenceRow[] {
-    const keywords = extractLookupKeywords(question, clientName);
-    const ranked = evidenceRows
-      .map((row) => ({
-        row,
-        score: scoreMessageForKeywords(row.content, keywords),
-      }))
-      .sort(
-        (a, b) =>
-          b.score - a.score ||
-          String(b.row.createdAt).localeCompare(String(a.row.createdAt)),
-      );
-    const matched = keywords.length > 0 ? ranked.filter((item) => item.score > 0) : ranked;
-    const selected = (matched.length > 0 ? matched : ranked).slice(0, snippetLimit).map((item) => item.row);
-    if (selected.length > 0) return selected;
+    const prioritized = evidenceRows.filter(
+      (row) => row.senderType !== 'AI_AGENT' && row.senderType !== 'SYSTEM',
+    );
+    const source = prioritized.length > 0 ? prioritized : evidenceRows;
+    const selected: ClientMessageEvidenceRow[] = [];
+    const seenAppointments = new Set<string>();
 
-    return evidenceRows
-      .filter((row) => row.senderType === 'FAMILY' || row.senderType === 'COORDINATOR')
-      .slice(0, snippetLimit);
+    for (const row of source) {
+      if (selected.length >= snippetLimit) break;
+      if (seenAppointments.has(row.appointmentId)) continue;
+      selected.push(row);
+      seenAppointments.add(row.appointmentId);
+    }
+
+    for (const row of source) {
+      if (selected.length >= snippetLimit) break;
+      if (selected.includes(row)) continue;
+      selected.push(row);
+    }
+
+    for (const row of evidenceRows) {
+      if (selected.length >= snippetLimit) break;
+      if (selected.includes(row)) continue;
+      selected.push(row);
+    }
+
+    return selected.slice(0, snippetLimit);
   }
 
   async function selectRelevantEvidenceWithLLM(input: {
@@ -1910,6 +3193,12 @@ Output schema:
     targetBusinessDate?: string;
     specificAppointmentId?: string;
   }): Promise<ClientInfoLookupResult> {
+    const appointmentLimit = clampInteger(
+      input.appointmentLimit,
+      1,
+      120,
+      CLIENT_LOOKUP_DEFAULT_APPOINTMENT_LIMIT,
+    );
     const messageLimit = clampInteger(
       input.messageLimit,
       20,
@@ -1958,7 +3247,32 @@ Output schema:
       };
     }
 
-    const messageParams = [...params, String(messageLimit)];
+    const appointmentScopeParams = [...params, String(appointmentLimit)];
+    const appointmentScopeRes = await pool.query(
+      `
+        SELECT
+          a.id::text AS appointment_id
+        FROM appointments a
+        ${whereSql}
+        ORDER BY a.start_time DESC
+        LIMIT $${appointmentScopeParams.length}::int
+      `,
+      appointmentScopeParams,
+    );
+    const scopedAppointmentIdsRaw = appointmentScopeRes.rows
+      .map((row) => String(row.appointment_id || '').trim())
+      .filter(Boolean);
+    const scopedAppointmentIds = clampAppointmentIdsByLimit(scopedAppointmentIdsRaw, appointmentLimit);
+    const scopedAppointmentCount = scopedAppointmentIds.length;
+    if (scopedAppointmentCount === 0) {
+      return {
+        response: `No appointments were found for ${input.clientName}.`,
+        scannedAppointments: 0,
+        scannedMessages: 0,
+        evidence: [],
+      };
+    }
+
     const messagesRes = await pool.query(
       `
         SELECT
@@ -1969,11 +3283,11 @@ Output schema:
           m.created_at::text AS created_at
         FROM messages m
         JOIN appointments a ON a.id = m.appointment_id
-        ${whereSql}
+        WHERE m.appointment_id = ANY($1::uuid[])
         ORDER BY m.created_at DESC
-        LIMIT $${messageParams.length}::int
+        LIMIT $2::int
       `,
-      messageParams,
+      [scopedAppointmentIds, String(messageLimit)],
     );
 
     const evidenceRows: ClientMessageEvidenceRow[] = messagesRes.rows.map((row) => ({
@@ -1993,38 +3307,10 @@ Output schema:
           : 'this client history';
       return {
         response: `I checked ${scope} for ${input.clientName}, but there are no messages yet.`,
-        scannedAppointments: appointmentCount,
+        scannedAppointments: scopedAppointmentCount,
         scannedMessages: 0,
         evidence: [],
       };
-    }
-
-    const normalizedQuestion = normalizeCommandText(input.question);
-
-    if (includesAnyTerm(normalizedQuestion, ['access code', 'entry code', 'gate code', 'door code', 'access', 'entry', 'code'])) {
-      for (const row of evidenceRows) {
-        const code = extractAccessCodeToken(row.content);
-        if (!code) continue;
-        return {
-          response: `Latest access code I found for ${input.clientName} is "${code}" from ${formatBusinessDateTime(row.createdAt)} [${row.senderType.toLowerCase()}].`,
-          scannedAppointments: appointmentCount,
-          scannedMessages: evidenceRows.length,
-          evidence: [row],
-        };
-      }
-    }
-
-    if (includesAnyTerm(normalizedQuestion, ['phone', 'call', 'number'])) {
-      for (const row of evidenceRows) {
-        const phone = extractPhoneToken(row.content);
-        if (!phone) continue;
-        return {
-          response: `Latest phone number mention for ${input.clientName} is "${phone}" from ${formatBusinessDateTime(row.createdAt)} [${row.senderType.toLowerCase()}].`,
-          scannedAppointments: appointmentCount,
-          scannedMessages: evidenceRows.length,
-          evidence: [row],
-        };
-      }
     }
 
     const llmSelected = await selectRelevantEvidenceWithLLM({
@@ -2033,12 +3319,12 @@ Output schema:
       evidenceRows,
       snippetLimit,
     });
-    const selected = llmSelected || fallbackSelectEvidenceRows(evidenceRows, input.question, input.clientName, snippetLimit);
+    const selected = llmSelected || fallbackSelectEvidenceRows(evidenceRows, snippetLimit);
 
     if (selected.length === 0) {
       return {
         response: `I searched ${evidenceRows.length} messages for ${input.clientName}, but I could not find enough detail to answer "${input.question.trim()}".`,
-        scannedAppointments: appointmentCount,
+        scannedAppointments: scopedAppointmentCount,
         scannedMessages: evidenceRows.length,
         evidence: [],
       };
@@ -2054,7 +3340,7 @@ Output schema:
         `Most relevant notes:`,
         snippets.join('\n'),
       ].join('\n'),
-      scannedAppointments: appointmentCount,
+      scannedAppointments: scopedAppointmentCount,
       scannedMessages: evidenceRows.length,
       evidence: selected,
     };
@@ -2092,7 +3378,7 @@ Output schema:
             {
               role: 'system',
               content:
-                'You are a caregiver logistics assistant. Answer strictly from provided evidence. If the evidence contains direct details (for example item names, codes, timing, family statements), state them explicitly. If evidence is insufficient, say so briefly. Keep answer concise (2-4 sentences).',
+                'You are a caregiver logistics assistant. Answer strictly from provided evidence. State concrete facts directly when they are present, and if evidence is insufficient, say that briefly. Keep the answer concise (2-4 sentences).',
             },
             {
               role: 'user',
@@ -2220,18 +3506,15 @@ Output schema:
   app.get('/appointments', async (req: Request, res: Response) => {
     try {
       const sessionUser = getSessionUser(req);
-      // 1. Extract identity (prefer authenticated session when present)
-      const { userId, role, caregiverId, date } = req.query;
-      
-      // Fallback just in case the frontend still sends caregiverId
-      const targetId = sessionUser?.userId || userId || caregiverId; 
-      const effectiveRole = String(sessionUser?.role || role || '').toUpperCase();
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      // 1. Extract identity from authenticated session only.
+      const { date } = req.query;
+      const targetId = sessionUser.userId;
+      const effectiveRole = String(sessionUser.role || '').toUpperCase();
       const requestedDate = String(date || '').trim();
       const hasDateFilter = /^\d{4}-\d{2}-\d{2}$/.test(requestedDate);
-
-      if (!targetId && effectiveRole !== 'COORDINATOR') {
-        return res.status(400).json({ error: 'Missing userId' });
-      }
 
       console.log(`[API] Fetching appointments for: ${targetId} (Role: ${effectiveRole})`, {
         dateFilter: hasDateFilter ? requestedDate : 'none',
@@ -2926,9 +4209,26 @@ Output schema:
   app.post('/messages', async (req: Request, res: Response) => {
     try {
       const sessionUser = getSessionUser(req);
-      const { appointmentId, content, senderType, senderId } = req.body;
-      const finalSenderType = senderType || sessionUser?.role || 'CAREGIVER';
-      const finalSenderId = senderId || sessionUser?.userId || 'CG-DEMO-USER';
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+
+      const appointmentId = String(req.body.appointmentId || '').trim();
+      const content = String(req.body.content || '').trim();
+      if (!appointmentId || !content) {
+        return res.status(400).json({ error: 'appointmentId and content are required' });
+      }
+
+      const appointmentScope = await loadAppointmentScope(appointmentId);
+      if (!appointmentScope) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+      if (!canSessionAccessAppointment(sessionUser, appointmentScope)) {
+        return res.status(403).json({ error: 'You are not allowed to post messages for this appointment' });
+      }
+
+      const finalSenderType = senderTypeForSessionRole(sessionUser.role);
+      const finalSenderId = sessionUser.userId;
 
       const dbResult = await pool.query(`
         INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
@@ -2959,7 +4259,18 @@ Output schema:
     try {
       const { id } = req.params;
       const sessionUser = getSessionUser(req);
-      const role = String(sessionUser?.role || req.query.role || '').toUpperCase();
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      const appointmentScope = await loadAppointmentScope(id);
+      if (!appointmentScope) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+      if (!canSessionAccessAppointment(sessionUser, appointmentScope)) {
+        return res.status(403).json({ error: 'You are not allowed to view messages for this appointment' });
+      }
+
+      const role = String(sessionUser.role || '').toUpperCase();
       const isCareTeamViewer = role === 'CAREGIVER' || role === 'COORDINATOR';
 
       const result = await pool.query(
@@ -2983,6 +4294,9 @@ Output schema:
   app.get('/agents/:userId/status', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const result = await pool.query(
         `SELECT status FROM user_agents WHERE user_id = $1`, 
         [userId]
@@ -3001,6 +4315,9 @@ Output schema:
   app.put('/agents/:userId/status', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const { status } = req.body; // 'ACTIVE' or 'PAUSED'
 
       await pool.query(`
@@ -3022,6 +4339,9 @@ Output schema:
   app.get('/agents/:userId/delegations', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const { settings } = await getAgentSettings(userId);
       const delegations = Object.values(settings.delegations || {});
       const now = new Date().toISOString();
@@ -3058,12 +4378,64 @@ Output schema:
     }
   });
 
+  // GET /agents/:userId/chat/history
+  // Persistent Agent Desk thread history (newest-first pagination).
+  app.get('/agents/:userId/chat/history', async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
+
+      const limit = clampInteger(req.query.limit, 1, 200, 80);
+      const before = String(req.query.before || '').trim();
+      if (before && Number.isNaN(Date.parse(before))) {
+        return res.status(400).json({ error: 'before must be a valid ISO timestamp' });
+      }
+      let rows = await listAgentDeskMessages({
+        caregiverId: userId,
+        limit,
+        before: before || undefined,
+      });
+      if (rows.length === 0 || !shouldUseAgentDeskPersistence()) {
+        const { settings } = await getAgentSettings(userId);
+        const assistantState = getAssistantState(settings);
+        const legacyRows = listLegacyAgentDeskMessagesFromAssistantHistory({
+          caregiverId: userId,
+          assistantHistory: assistantState.history,
+          limit,
+          before: before || undefined,
+        });
+        if (legacyRows.length > 0) {
+          rows = legacyRows;
+        }
+      }
+      const nextCursor = rows.length > 0 ? rows[rows.length - 1].createdAt : null;
+
+      return res.json({
+        success: true,
+        data: rows,
+        paging: {
+          limit,
+          nextCursor,
+          hasMore: rows.length >= limit,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to load agent desk chat history', error);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
   // POST /agents/:userId/delegations/start
   // Starts a time-boxed delegation for an appointment
   app.post('/agents/:userId/delegations/start', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
-      const { appointmentId, objective, durationMinutes, questions, forceStart } = req.body;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
+      const { appointmentId, objective, durationMinutes, questions, questionItems, delegationType, forceStart } = req.body;
 
       if (!appointmentId || !objective || !durationMinutes) {
         return res.status(400).json({ error: 'appointmentId, objective, durationMinutes are required' });
@@ -3074,6 +4446,15 @@ Output schema:
         objective: String(objective),
         durationMinutes: Number(durationMinutes),
         questions: Array.isArray(questions) ? questions : [],
+        questionItems: Array.isArray(questionItems) ? questionItems : undefined,
+        delegationType:
+          (() => {
+            const raw = String(delegationType || '').trim().toUpperCase();
+            if (raw === 'FACT_CHECK' || raw === 'LOGISTICS' || raw === 'OPEN_ENDED') {
+              return raw as DelegationType;
+            }
+            return undefined;
+          })(),
         forceStart: Boolean(forceStart),
       });
       if (!startResult.ok) {
@@ -3098,13 +4479,20 @@ Output schema:
   app.post('/agents/:userId/command', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const rawCommand = String(req.body.command || req.body.text || '').trim();
       const requestedAppointmentId = String(req.body.appointmentId || '').trim();
       const forceStart = Boolean(req.body.forceStart);
       const requestedDuration = Number(req.body.durationMinutes);
       const toolTrace: AgentToolTraceEntry[] = [];
-      const withToolTrace = <T extends Record<string, any>>(data: T): T & { toolTrace: AgentToolTraceEntry[] } => ({
+      let lastAssistantChatMessageId: string | undefined;
+      const withToolTrace = <T extends Record<string, any>>(
+        data: T,
+      ): T & { toolTrace: AgentToolTraceEntry[]; chatMessageId?: string } => ({
         ...data,
+        ...(lastAssistantChatMessageId ? { chatMessageId: lastAssistantChatMessageId } : {}),
         toolTrace,
       });
       const appointmentSearchLimit = clampInteger(
@@ -3130,14 +4518,113 @@ Output schema:
         return res.status(400).json({ error: 'command is required' });
       }
 
-      const { settings, role } = await getAgentSettings(userId);
-      let assistantState = appendAssistantTurn(getAssistantState(settings), 'CAREGIVER', rawCommand);
-      const persistAssistantState = async () => {
-        settings.assistant = assistantState;
-        await saveAgentSettings(userId, role || 'CAREGIVER', settings);
-      };
+      let { settings, role, version: settingsVersion } = await getAgentSettings(userId);
+      let assistantState = appendAssistantTurn(getAssistantState(settings), 'CAREGIVER', rawCommand, {
+        appointmentId: normalizeOptionalUuid(requestedAppointmentId),
+      });
+      const commandTurn = assistantState.history[assistantState.history.length - 1];
+      if (commandTurn) {
+        try {
+          await appendAgentDeskMessage({
+            caregiverId: userId,
+            actorType: 'CAREGIVER',
+            appointmentId: commandTurn.appointmentId || normalizeOptionalUuid(requestedAppointmentId),
+            content: commandTurn.content,
+            source: 'AGENT_COMMAND',
+            metadata: {
+              route: '/agents/:userId/command',
+            },
+            dedupeKey: buildAgentDeskTurnDedupeKey({
+              caregiverId: userId,
+              role: 'CAREGIVER',
+              content: commandTurn.content,
+              createdAt: commandTurn.createdAt,
+            }),
+            createdAt: commandTurn.createdAt,
+          });
+        } catch (error) {
+          console.warn('[AGENT] Failed to persist caregiver command to agent desk history', {
+            caregiverId: userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
 
-      if (!assistantState.pending && looksLikeGreeting(rawCommand)) {
+      const persistAssistantState = async (options?: { source?: string; metadata?: Record<string, unknown> }) => {
+        const toTurnKey = (turn: AssistantTurn): string => {
+          const hash = crypto
+            .createHash('sha1')
+            .update(`${turn.role}|${turn.content}`)
+            .digest('hex')
+            .slice(0, 16);
+          return `${turn.createdAt}|${turn.role}|${hash}`;
+        };
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const baseSettings = attempt === 0 ? settings : (await getAgentSettings(userId)).settings;
+          const previousAssistant = getAssistantState(baseSettings);
+          const previousTurnKeys = new Set(previousAssistant.history.map(toTurnKey));
+          const candidateSettings = { ...baseSettings };
+          candidateSettings.assistant = assistantState;
+          const expectedVersion = attempt === 0 ? settingsVersion : getAgentSettingsVersion(candidateSettings);
+          try {
+            settingsVersion = await saveAgentSettings(userId, role || 'CAREGIVER', candidateSettings, {
+              expectedVersion,
+            });
+            settings = candidateSettings;
+            if (shouldUseAgentDeskPersistence()) {
+              const persistedAssistantIds: string[] = [];
+              try {
+                for (const turn of assistantState.history) {
+                  const turnKey = toTurnKey(turn);
+                  if (previousTurnKeys.has(turnKey)) continue;
+                  const actorType: AgentDeskActorType = turn.role === 'CAREGIVER' ? 'CAREGIVER' : 'ASSISTANT';
+                  const messageId = await appendAgentDeskMessage({
+                    caregiverId: userId,
+                    actorType,
+                    appointmentId: turn.appointmentId,
+                    content: turn.content,
+                    source: String(options?.source || 'AGENT_COMMAND'),
+                    metadata: {
+                      ...(options?.metadata || {}),
+                      turnCreatedAt: turn.createdAt,
+                    },
+                    dedupeKey: buildAgentDeskTurnDedupeKey({
+                      caregiverId: userId,
+                      role: actorType,
+                      content: turn.content,
+                      createdAt: turn.createdAt,
+                    }),
+                    createdAt: turn.createdAt,
+                  });
+                  if (actorType === 'ASSISTANT' && messageId) {
+                    persistedAssistantIds.push(messageId);
+                  }
+                }
+              } catch (error) {
+                console.warn('[AGENT] Failed to persist assistant state delta to agent desk history', {
+                  caregiverId: userId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+              if (persistedAssistantIds.length > 0) {
+                lastAssistantChatMessageId = persistedAssistantIds[persistedAssistantIds.length - 1];
+              }
+            }
+            return;
+          } catch (error) {
+            const isConflict = error instanceof SettingsVersionConflictError;
+            if (!isConflict || attempt === 1) {
+              throw error;
+            }
+          }
+        }
+      };
+      const turnSignals = await analyzeCaregiverTurnWithLLM({
+        command: rawCommand,
+        assistantState,
+      });
+
+      if (!assistantState.pending && turnSignals.isGreeting) {
         const responseText = 'Hi. I can help with your schedule, route timing, client history, or delegation follow-ups. What do you want first?';
         assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
         await persistAssistantState();
@@ -3150,7 +4637,7 @@ Output schema:
         });
       }
 
-      if (!assistantState.pending && looksLikeAcknowledgement(rawCommand)) {
+      if (!assistantState.pending && turnSignals.isAcknowledgement) {
         const responseText = 'Tell me what you want to do next, and I will handle it.';
         assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
         await persistAssistantState();
@@ -3163,7 +4650,7 @@ Output schema:
         });
       }
 
-      if (isCancellationMessage(rawCommand) && assistantState.pending) {
+      if (turnSignals.isCancellation && assistantState.pending) {
         assistantState = clearAssistantPending(assistantState);
         const responseText = 'Understood. I cancelled that in-progress request. What do you want to do next?';
         assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
@@ -3177,7 +4664,23 @@ Output schema:
         });
       }
 
-      const commandForPlanning = combineCommandWithPending(assistantState, rawCommand);
+      const shouldMergePending = Boolean(
+        assistantState.pending &&
+          turnSignals.mergeWithPending &&
+          !turnSignals.isCancellation,
+      );
+      const commandForPlanning = combineCommandWithPending(
+        assistantState,
+        rawCommand,
+        shouldMergePending,
+      );
+      const pendingExecutionCommand = assistantState.pending
+        ? combineCommandWithPending(assistantState, rawCommand, true)
+        : commandForPlanning;
+      const commandForToolExecution =
+        assistantState.pending && (shouldMergePending || turnSignals.executePending)
+          ? pendingExecutionCommand
+          : commandForPlanning;
       const dateHintFromCommand = parseBusinessDateHint(rawCommand);
       if (dateHintFromCommand) {
         assistantState = {
@@ -3197,69 +4700,128 @@ Output schema:
         startedAtMs: scheduleAllStartMs,
         ok: true,
       });
+      const llmContextResolution = await resolveAppointmentWithLLM({
+        appointments,
+        command: rawCommand,
+        requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+        memory: assistantState.memory,
+      });
+      const deterministicExplicitContextForTurn = hasExplicitAppointmentContext({
+        command: rawCommand,
+        appointments,
+        requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+      });
+      const explicitContextForTurn =
+        llmContextResolution?.explicitContext ??
+        deterministicExplicitContextForTurn;
+      const commandForTargetResolution =
+        assistantState.pending && (shouldMergePending || turnSignals.executePending)
+          ? deterministicExplicitContextForTurn
+            ? rawCommand
+            : assistantState.pending.baseCommand
+          : deterministicExplicitContextForTurn
+            ? rawCommand
+            : commandForToolExecution;
 
       let plannerDecision: AssistantPlannerDecision | null = null;
       const plannerStartMs = Date.now();
-      try {
-        plannerDecision = await planAssistantDecisionWithLLM({
-          userId,
+      const aiFirstIntentEnabled =
+        shouldUseAiFirstIntent(config.assistant) && Boolean(config.openai.apiKey);
+      if (aiFirstIntentEnabled) {
+        try {
+          plannerDecision = await planAssistantDecisionWithLLM({
+            userId,
+            command: commandForPlanning,
+            assistantState,
+            appointments,
+            requestedAppointmentId: requestedAppointmentId || undefined,
+          });
+          recordToolTrace(toolTrace, {
+            tool: 'assistant.plan_decision',
+            source: 'openai_chat_completions',
+            startedAtMs: plannerStartMs,
+            ok: Boolean(plannerDecision),
+            errorCode: plannerDecision ? undefined : 'EMPTY_PLAN',
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          recordToolTrace(toolTrace, {
+            tool: 'assistant.plan_decision',
+            source: 'openai_chat_completions',
+            startedAtMs: plannerStartMs,
+            ok: false,
+            errorCode: 'UPSTREAM_UNAVAILABLE',
+            message,
+          });
+        }
+      } else {
+        plannerDecision = maybeDeterministicFallbackPlannerDecision({
           command: commandForPlanning,
+          turnSignals,
           assistantState,
-          appointments,
-          requestedAppointmentId: requestedAppointmentId || undefined,
         });
-        recordToolTrace(toolTrace, {
-          tool: 'assistant.plan_decision',
-          source: 'openai_chat_completions',
-          startedAtMs: plannerStartMs,
-          ok: Boolean(plannerDecision),
-          errorCode: plannerDecision ? undefined : 'EMPTY_PLAN',
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        recordToolTrace(toolTrace, {
-          tool: 'assistant.plan_decision',
-          source: 'openai_chat_completions',
-          startedAtMs: plannerStartMs,
-          ok: false,
-          errorCode: 'UPSTREAM_UNAVAILABLE',
-          message,
-        });
+        if (plannerDecision) {
+          recordToolTrace(toolTrace, {
+            tool: 'assistant.plan_decision',
+            source: 'deterministic_policy',
+            startedAtMs: plannerStartMs,
+            ok: true,
+            message: 'Used deterministic planner path (AI-first disabled or no LLM key).',
+          });
+        }
       }
 
-      const intentHint = detectAgentCommandIntent(commandForPlanning);
       if (!plannerDecision) {
-        if (intentHint === 'SCHEDULE_OVERVIEW') {
-          plannerDecision = { action: 'USE_TOOL', tool: 'SCHEDULE_DAY' };
-        } else if (intentHint === 'MAPS_ROUTE') {
-          plannerDecision = { action: 'USE_TOOL', tool: 'MAPS_ROUTE' };
-        } else if (intentHint === 'START_DELEGATION') {
-          plannerDecision = { action: 'USE_TOOL', tool: 'START_DELEGATION' };
-        } else if (intentHint === 'LOOKUP_ACCESS_CODE' || intentHint === 'CLIENT_INFO_LOOKUP') {
-          plannerDecision = {
-            action: 'USE_TOOL',
-            tool: 'CLIENT_INFO',
-            infoQuestion: rawCommand,
-          };
+        const deterministicFallback = maybeDeterministicFallbackPlannerDecision({
+          command: commandForPlanning,
+          turnSignals,
+          assistantState,
+        });
+        if (deterministicFallback) {
+          plannerDecision = deterministicFallback;
+          recordToolTrace(toolTrace, {
+            tool: 'assistant.plan_decision',
+            source: 'deterministic_fallback',
+            startedAtMs: plannerStartMs,
+            ok: true,
+            message: aiFirstIntentEnabled
+              ? 'LLM planner unavailable/empty; used deterministic fallback.'
+              : 'Used deterministic fallback.',
+          });
+        }
+      }
+
+      if (!plannerDecision) {
+        if (assistantState.pending && (shouldMergePending || turnSignals.executePending)) {
+          plannerDecision = buildPendingToolDecision(assistantState, pendingExecutionCommand) || { action: 'RESPOND' };
         } else {
           plannerDecision = {
             action: 'RESPOND',
-            response: 'I can help with schedule, routing, client-history questions, and delegation. Tell me what you need and I will handle it step by step.',
           };
         }
       }
 
-      const pickTargetAppointment = (commandForResolution: string): CaregiverAppointmentRow | null => {
+      const pickTargetAppointment = async (commandForResolution: string): Promise<CaregiverAppointmentRow | null> => {
         const resolveStartMs = Date.now();
-        const target = pickAppointmentForConversation({
+        const llmResolved = await resolveAppointmentWithLLM({
           appointments,
           command: commandForResolution,
           requestedAppointmentId: requestedAppointmentId || undefined,
           memory: assistantState.memory,
         });
+        const target =
+          llmResolved?.appointment ||
+          (llmResolved?.explicitContext
+            ? null
+            : pickAppointmentForConversation({
+                appointments,
+                command: commandForResolution,
+                requestedAppointmentId: requestedAppointmentId || undefined,
+                memory: assistantState.memory,
+              }));
         recordToolTrace(toolTrace, {
           tool: 'appointment.resolve_target',
-          source: 'in_memory',
+          source: llmResolved ? 'openai_chat_completions+in_memory_fallback' : 'in_memory',
           startedAtMs: resolveStartMs,
           ok: Boolean(target),
           errorCode: target ? undefined : 'NOT_FOUND',
@@ -3271,28 +4833,203 @@ Output schema:
       if (
         assistantState.pending &&
         plannerDecision.action === 'RESPOND' &&
-        shouldMergeWithPending(assistantState, rawCommand) &&
-        !isCancellationMessage(rawCommand)
+        (shouldMergePending || turnSignals.executePending)
       ) {
+        plannerDecision = buildPendingToolDecision(assistantState, pendingExecutionCommand) || plannerDecision;
+      }
+
+      const allowLegacyPlannerRecovery = shouldUseLegacyPlannerRecovery(config.assistant);
+      if (
+        allowLegacyPlannerRecovery &&
+        plannerDecision.action === 'RESPOND' &&
+        !plannerDecision.tool &&
+        !turnSignals.isCancellation
+      ) {
+        const recoverStartMs = Date.now();
+        const recovered = await recoverToolDecisionWithLLM({
+          command: commandForPlanning,
+          assistantState,
+          appointments,
+          requestedAppointmentId: requestedAppointmentId || undefined,
+        });
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.recover_tool_decision',
+          source: config.openai.apiKey ? 'openai_chat_completions' : 'disabled',
+          startedAtMs: recoverStartMs,
+          ok: Boolean(recovered),
+        });
+        if (recovered?.action === 'USE_TOOL' && recovered.tool) {
+          plannerDecision = recovered;
+        }
+      } else if (
+        !allowLegacyPlannerRecovery &&
+        plannerDecision.action === 'RESPOND' &&
+        !plannerDecision.tool &&
+        !turnSignals.isCancellation
+      ) {
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.recover_tool_decision',
+          source: 'disabled_by_single_router_policy',
+          startedAtMs: Date.now(),
+          ok: true,
+          message: 'Skipped legacy recovery hop in single-router mode.',
+        });
+      }
+
+      if (
+        assistantState.pending &&
+        !turnSignals.isCancellation &&
+        turnSignals.executePending &&
+        plannerDecision.action !== 'USE_TOOL'
+      ) {
+        plannerDecision = buildPendingToolDecision(assistantState, pendingExecutionCommand) || plannerDecision;
+      }
+
+      plannerDecision = applyRouterContractDefaults(plannerDecision);
+
+      const shouldForceDelegation =
+        !turnSignals.isCancellation &&
+        hasDelegationIntent(commandForPlanning) &&
+        hasExplicitDelegationDirective(commandForPlanning) &&
+        !(plannerDecision.action === 'USE_TOOL' && plannerDecision.tool === 'START_DELEGATION');
+      if (shouldForceDelegation) {
         plannerDecision = {
           action: 'USE_TOOL',
-          tool: assistantState.pending.tool,
-          infoQuestion:
-            assistantState.pending.tool === 'CLIENT_INFO'
-              ? combineCommandWithPending(assistantState, rawCommand)
-              : undefined,
-          objective:
-            assistantState.pending.tool === 'START_DELEGATION'
-              ? combineCommandWithPending(assistantState, rawCommand)
-              : undefined,
+          tool: 'START_DELEGATION',
+          objective: String(commandForPlanning || rawCommand).trim(),
         };
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.delegation_safety_override',
+          source: 'deterministic_safety',
+          startedAtMs: Date.now(),
+          ok: true,
+          message: 'Forced START_DELEGATION due to explicit caregiver outreach directive.',
+        });
       }
+
+      const requiresDelegationContactConfirmation =
+        plannerDecision.action === 'USE_TOOL' &&
+        plannerDecision.tool === 'START_DELEGATION' &&
+        !turnSignals.isCancellation &&
+        !(
+          assistantState.pending?.kind === 'DELEGATION_CONTACT_CONFIRM' &&
+          turnSignals.executePending
+        );
+      if (requiresDelegationContactConfirmation) {
+        const confirmationPrompt =
+          'I can contact the client/family to find out the missing details. Do you want me to reach out now? Reply yes to proceed or cancel to stop.';
+        assistantState = setAssistantPending(assistantState, {
+          kind: 'DELEGATION_CONTACT_CONFIRM',
+          tool: 'START_DELEGATION',
+          baseCommand: commandForToolExecution,
+          requestedAppointmentId:
+            requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+        });
+        assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', confirmationPrompt);
+        await persistAssistantState();
+        return res.json({
+          success: true,
+          data: withToolTrace({
+            mode: 'FOLLOW_UP',
+            response: confirmationPrompt,
+          }),
+        });
+      }
+
+      if (
+        plannerDecision.action === 'ASK_FOLLOW_UP' &&
+        assistantState.pending &&
+        (shouldMergePending || turnSignals.executePending)
+      ) {
+        plannerDecision = buildPendingToolDecision(assistantState, pendingExecutionCommand) || plannerDecision;
+      }
+
+      if (plannerDecision.action === 'ASK_FOLLOW_UP') {
+        const followUpTool = inferToolForFollowUp(plannerDecision, assistantState, commandForPlanning);
+        if (!followUpTool && !assistantState.pending) {
+          plannerDecision = {
+            action: 'RESPOND',
+            response:
+              plannerDecision.response ||
+              'I can answer directly when possible, and for tool-driven tasks I will ask only the minimum needed detail.',
+          };
+        } else if (followUpTool === 'MAPS_ROUTE') {
+          plannerDecision = {
+            action: 'USE_TOOL',
+            tool: 'MAPS_ROUTE',
+            homeAddress: plannerDecision.homeAddress,
+            appointmentHint: plannerDecision.appointmentHint,
+          };
+        } else if (followUpTool === 'CLIENT_INFO' || followUpTool === 'START_DELEGATION') {
+          const resolutionCommand = `${commandForPlanning} ${plannerDecision.appointmentHint || ''}`.trim();
+          const inferredTarget = await pickTargetAppointment(resolutionCommand);
+          if (inferredTarget) {
+            plannerDecision = {
+              action: 'USE_TOOL',
+              tool: followUpTool,
+              appointmentHint: plannerDecision.appointmentHint,
+              infoQuestion:
+                followUpTool === 'CLIENT_INFO'
+                  ? String(plannerDecision.infoQuestion || commandForPlanning).trim()
+                  : undefined,
+              objective:
+                followUpTool === 'START_DELEGATION'
+                  ? String(plannerDecision.objective || commandForPlanning).trim()
+                  : undefined,
+              questions:
+                followUpTool === 'START_DELEGATION' && Array.isArray(plannerDecision.questions)
+                  ? plannerDecision.questions
+                  : undefined,
+            };
+          }
+        }
+      }
+
+      plannerDecision = applyRouterContractDefaults(plannerDecision);
 
       if (plannerDecision.action === 'ASK_FOLLOW_UP') {
         const followUpTool = inferToolForFollowUp(plannerDecision, assistantState, commandForPlanning);
         const followUpText =
           plannerDecision.followUpQuestion ||
+          buildFollowUpQuestionFromRequiredSlots(plannerDecision.requiredSlots, followUpTool) ||
           'Can you clarify which visit or details you want me to use before I proceed?';
+        const repeatedFollowUp = isRepeatedAssistantPrompt(assistantState.history, followUpText);
+        if (repeatedFollowUp) {
+          const directReplyStartMs = Date.now();
+          const directReply = await generateAssistantDirectResponseWithLLM({
+            command: rawCommand,
+            assistantState,
+            appointments,
+            plannerHint:
+              'Avoid repeating the same follow-up. Give one concise best-effort answer with limits and a single next step.',
+          });
+          recordToolTrace(toolTrace, {
+            tool: 'assistant.respond_freeform',
+            source: config.openai.apiKey ? 'openai_chat_completions' : 'disabled',
+            startedAtMs: directReplyStartMs,
+            ok: true,
+          });
+          const responseText = await sanitizeNonToolAssistantResponse({
+            response:
+              directReply ||
+              'I cannot proceed with that tool from the details so far. Give the missing detail in one message, or ask me to handle another task.',
+            command: rawCommand,
+            assistantState,
+            appointments,
+            settings,
+            appointmentIdHint: requestedAppointmentId || assistantState.memory?.appointmentId,
+          });
+          assistantState = clearAssistantPending(assistantState);
+          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
+          await persistAssistantState();
+          return res.json({
+            success: true,
+            data: withToolTrace({
+              mode: 'ANSWERED',
+              response: responseText,
+            }),
+          });
+        }
 
         const pendingBase = assistantState.pending?.baseCommand || rawCommand;
         if (followUpTool === 'MAPS_ROUTE' || assistantState.pending?.kind === 'MAPS_HOME_ADDRESS') {
@@ -3309,9 +5046,16 @@ Output schema:
             baseCommand: pendingBase,
             requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
           });
-        } else if (followUpTool === 'START_DELEGATION' || assistantState.pending?.kind === 'DELEGATION_CONTEXT') {
+        } else if (
+          followUpTool === 'START_DELEGATION' ||
+          assistantState.pending?.kind === 'DELEGATION_CONTEXT' ||
+          assistantState.pending?.kind === 'DELEGATION_TARGET_CONTEXT'
+        ) {
           assistantState = setAssistantPending(assistantState, {
-            kind: 'DELEGATION_CONTEXT',
+            kind:
+              assistantState.pending?.kind === 'DELEGATION_TARGET_CONTEXT'
+                ? 'DELEGATION_TARGET_CONTEXT'
+                : 'DELEGATION_CONTEXT',
             tool: 'START_DELEGATION',
             baseCommand: pendingBase,
             requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
@@ -3331,11 +5075,19 @@ Output schema:
 
       if (plannerDecision.action === 'RESPOND' || !plannerDecision.tool) {
         const directReplyStartMs = Date.now();
+        const plannerHint = [
+          plannerDecision.response,
+          plannerDecision.responseStyle === 'STEP_BY_STEP'
+            ? 'Use a short numbered step-by-step response.'
+            : 'Keep the response concise and direct.',
+        ]
+          .filter((line): line is string => Boolean(line && String(line).trim()))
+          .join('\n');
         const directReply = await generateAssistantDirectResponseWithLLM({
           command: rawCommand,
           assistantState,
           appointments,
-          plannerHint: plannerDecision.response,
+          plannerHint,
         });
         recordToolTrace(toolTrace, {
           tool: 'assistant.respond_freeform',
@@ -3344,10 +5096,60 @@ Output schema:
           ok: true,
         });
 
-        const responseText =
+        const rawResponseText =
           directReply ||
           plannerDecision.response ||
           'I can help with your schedule, routes, client context, and delegation workflows. What should I handle first?';
+        const responseText = await sanitizeNonToolAssistantResponse({
+          response: rawResponseText,
+          command: rawCommand,
+          assistantState,
+          appointments,
+          settings,
+          appointmentIdHint: requestedAppointmentId || assistantState.memory?.appointmentId,
+        });
+        const missingInfoPolicyStartMs = Date.now();
+        const missingInfoDecision = await evaluateMissingInfoPolicy({
+          command: rawCommand,
+          answerDraft: responseText,
+          source: 'RESPOND',
+        });
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.missing_info_policy',
+          source: config.openai.apiKey ? 'openai_chat_completions+deterministic_fallback' : 'deterministic_policy',
+          startedAtMs: missingInfoPolicyStartMs,
+          ok: true,
+          message: `${missingInfoDecision.action} (${missingInfoDecision.rationale})`,
+        });
+        const hasActiveDelegationForResponseContext = hasRelevantActiveDelegation({
+          settings,
+          appointmentId: requestedAppointmentId || assistantState.memory?.appointmentId,
+        });
+        const shouldAskDelegationConfirmation =
+          missingInfoDecision.action === 'ACQUIRE_MISSING_INFO' &&
+          missingInfoDecision.confidence >= 0.55 &&
+          !hasActiveDelegationForResponseContext &&
+          assistantState.pending?.kind !== 'DELEGATION_CONTACT_CONFIRM' &&
+          !turnSignals.isCancellation;
+        if (shouldAskDelegationConfirmation) {
+          const confirmationPrompt = buildDelegationContactConfirmationPrompt(responseText);
+          assistantState = setAssistantPending(assistantState, {
+            kind: 'DELEGATION_CONTACT_CONFIRM',
+            tool: 'START_DELEGATION',
+            baseCommand: commandForToolExecution,
+            requestedAppointmentId:
+              requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+          });
+          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', confirmationPrompt);
+          await persistAssistantState();
+          return res.json({
+            success: true,
+            data: withToolTrace({
+              mode: 'FOLLOW_UP',
+              response: confirmationPrompt,
+            }),
+          });
+        }
         assistantState = { ...assistantState, pending: undefined };
         assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
         await persistAssistantState();
@@ -3361,9 +5163,9 @@ Output schema:
       }
 
       if (plannerDecision.tool === 'SCHEDULE_DAY') {
-        const businessDate = getCurrentBusinessDateIso();
+        const businessDate = resolveRequestedBusinessDate(commandForToolExecution, assistantState.memory?.businessDateHint);
         const scheduleStartMs = Date.now();
-        const todayAppointments = await loadCaregiverAppointments(userId, { businessDate });
+        const dayAppointments = await loadCaregiverAppointments(userId, { businessDate });
         recordToolTrace(toolTrace, {
           tool: 'schedule.get_day',
           source: 'postgres',
@@ -3371,7 +5173,7 @@ Output schema:
           ok: true,
         });
 
-        const responseText = buildScheduleOverviewResponse(todayAppointments);
+        const responseText = buildScheduleOverviewResponse(dayAppointments, businessDate);
         assistantState = clearAssistantPending(assistantState);
         assistantState = {
           ...assistantState,
@@ -3387,7 +5189,7 @@ Output schema:
           data: withToolTrace({
             mode: 'ANSWERED',
             response: responseText,
-            schedule: todayAppointments,
+            schedule: dayAppointments,
           }),
         });
       }
@@ -3395,10 +5197,12 @@ Output schema:
       if (plannerDecision.tool === 'MAPS_ROUTE') {
         const mapsStartMs = Date.now();
         try {
-          const baseCommand = combineCommandWithPending(assistantState, rawCommand);
+          const baseCommand = commandForToolExecution;
+          const businessDate = resolveRequestedBusinessDate(baseCommand, assistantState.memory?.businessDateHint);
           const plan = await buildMapsDayPlan({
             userId,
             command: baseCommand,
+            businessDate,
             requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId || undefined,
             homeAddressOverride:
               plannerDecision.homeAddress || String(req.body.homeAddress || '').trim(),
@@ -3433,15 +5237,19 @@ Output schema:
           assistantState = updateAssistantMemoryFromResolved(
             assistantState,
             plan.resolvedAppointment || null,
-            parseBusinessDateHint(rawCommand),
+            businessDate,
           );
-          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', plan.response);
+          const disclosureResponse = appendInferredContextDisclosure(plan.response, {
+            inferred: !explicitContextForTurn,
+            appointment: targetAppointmentFromResolved(plan.resolvedAppointment || null, appointments),
+          });
+          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', disclosureResponse);
           await persistAssistantState();
           return res.json({
             success: true,
             data: withToolTrace({
               mode: 'ANSWERED',
-              response: plan.response,
+              response: disclosureResponse,
               resolvedAppointment: plan.resolvedAppointment,
               route: {
                 provider: 'GOOGLE_MAPS_DISTANCE_MATRIX',
@@ -3474,9 +5282,9 @@ Output schema:
       }
 
       if (plannerDecision.tool === 'CLIENT_INFO') {
-        const infoQuestion = String(plannerDecision.infoQuestion || combineCommandWithPending(assistantState, rawCommand));
-        const targetCommand = `${infoQuestion} ${plannerDecision.appointmentHint || ''}`.trim();
-        const targetAppointment = pickTargetAppointment(targetCommand);
+        const infoQuestion = String(plannerDecision.infoQuestion || commandForToolExecution);
+        const targetCommand = `${commandForTargetResolution} ${plannerDecision.appointmentHint || ''}`.trim();
+        const targetAppointment = await pickTargetAppointment(targetCommand);
         if (!targetAppointment) {
           const followUp =
             'Which client or visit should I check? You can mention the client name or select a visit first.';
@@ -3538,15 +5346,73 @@ Output schema:
           ok: true,
         });
 
+        const hasActiveDelegationForTarget = hasRelevantActiveDelegation({
+          settings,
+          appointmentId: targetAppointment.appointmentId,
+        });
+        const disclosedAnswer = enforceDelegationStateClaims({
+          response: appendInferredContextDisclosure(synthesized, {
+            inferred: !explicitContextForTurn,
+            appointment: targetAppointment,
+          }),
+          hasRelevantActiveDelegation: hasActiveDelegationForTarget,
+        });
+        const missingInfoPolicyStartMs = Date.now();
+        const missingInfoDecision = await evaluateMissingInfoPolicy({
+          command: infoQuestion || rawCommand,
+          answerDraft: disclosedAnswer,
+          source: 'CLIENT_INFO',
+        });
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.missing_info_policy',
+          source: config.openai.apiKey ? 'openai_chat_completions+deterministic_fallback' : 'deterministic_policy',
+          startedAtMs: missingInfoPolicyStartMs,
+          ok: true,
+          message: `${missingInfoDecision.action} (${missingInfoDecision.rationale})`,
+        });
+        const shouldAskDelegationConfirmation =
+          missingInfoDecision.action === 'ACQUIRE_MISSING_INFO' &&
+          missingInfoDecision.confidence >= 0.55 &&
+          !hasActiveDelegationForTarget &&
+          assistantState.pending?.kind !== 'DELEGATION_CONTACT_CONFIRM' &&
+          !turnSignals.isCancellation;
+        if (shouldAskDelegationConfirmation) {
+          assistantState = clearAssistantPending(assistantState);
+          assistantState = updateAssistantMemoryFromAppointment(assistantState, targetAppointment, businessDateHint);
+          const confirmationPrompt = buildDelegationContactConfirmationPrompt(disclosedAnswer);
+          assistantState = setAssistantPending(assistantState, {
+            kind: 'DELEGATION_CONTACT_CONFIRM',
+            tool: 'START_DELEGATION',
+            baseCommand: infoQuestion || commandForToolExecution,
+            requestedAppointmentId: targetAppointment.appointmentId,
+          });
+          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', confirmationPrompt);
+          await persistAssistantState();
+          return res.json({
+            success: true,
+            data: withToolTrace({
+              mode: 'FOLLOW_UP',
+              response: confirmationPrompt,
+              resolvedAppointment,
+              search: {
+                appointmentsScanned: lookup.scannedAppointments,
+                messagesScanned: lookup.scannedMessages,
+                appointmentLimit: appointmentSearchLimit,
+                messageLimit: messageSearchLimit,
+              },
+            }),
+          });
+        }
+
         assistantState = clearAssistantPending(assistantState);
         assistantState = updateAssistantMemoryFromAppointment(assistantState, targetAppointment, businessDateHint);
-        assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', synthesized);
+        assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', disclosedAnswer);
         await persistAssistantState();
         return res.json({
           success: true,
           data: withToolTrace({
             mode: 'ANSWERED',
-            response: synthesized,
+            response: disclosedAnswer,
             resolvedAppointment,
             search: {
               appointmentsScanned: lookup.scannedAppointments,
@@ -3559,14 +5425,43 @@ Output schema:
       }
 
       if (plannerDecision.tool === 'START_DELEGATION') {
-        const delegationCommand = combineCommandWithPending(assistantState, rawCommand);
-        const targetCommand = `${delegationCommand} ${plannerDecision.appointmentHint || ''}`.trim();
-        const targetAppointment = pickTargetAppointment(targetCommand);
+        const pendingForDelegation = assistantState.pending;
+        const confirmedDelegationContinuation =
+          pendingForDelegation?.kind === 'DELEGATION_CONTACT_CONFIRM' &&
+          turnSignals.executePending;
+        const delegationCommand =
+          confirmedDelegationContinuation && pendingForDelegation
+            ? pendingForDelegation.baseCommand
+            : commandForToolExecution;
+        if (
+          assistantState.pending?.kind === 'DELEGATION_TARGET_CONTEXT' &&
+          !deterministicExplicitContextForTurn
+        ) {
+          const followUp =
+            'Which visit should I delegate? Please give the client name or choose the target appointment.';
+          assistantState = setAssistantPending(assistantState, {
+            kind: 'DELEGATION_TARGET_CONTEXT',
+            tool: 'START_DELEGATION',
+            baseCommand: delegationCommand,
+            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+          });
+          assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', followUp);
+          await persistAssistantState();
+          return res.json({
+            success: true,
+            data: withToolTrace({
+              mode: 'FOLLOW_UP',
+              response: followUp,
+            }),
+          });
+        }
+        const targetCommand = `${commandForTargetResolution} ${plannerDecision.appointmentHint || ''}`.trim();
+        const targetAppointment = await pickTargetAppointment(targetCommand);
         if (!targetAppointment) {
           const followUp =
             'Which visit should I delegate? Please give the client name or choose the target appointment.';
           assistantState = setAssistantPending(assistantState, {
-            kind: 'DELEGATION_CONTEXT',
+            kind: 'DELEGATION_TARGET_CONTEXT',
             tool: 'START_DELEGATION',
             baseCommand: delegationCommand,
             requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
@@ -3589,12 +5484,71 @@ Output schema:
           appointmentStartTime: targetAppointment.startTime,
         };
 
+        const compilerStartMs = Date.now();
+        const compilerHistory = await loadDelegationCompilerHistory(userId, assistantState.history);
+        const compiledContext = config.assistant.delegationContextCompilerV1
+          ? await compileDelegationContext({
+              command: delegationCommand,
+              history: compilerHistory,
+              resolvedAppointment: {
+                appointmentId: targetAppointment.appointmentId,
+                clientName: targetAppointment.clientName,
+                appointmentStartTime: targetAppointment.startTime,
+              },
+              openaiApiKey: config.openai.apiKey,
+              model: config.openai.model,
+              maxQuestions: 5,
+            })
+          : null;
+        recordToolTrace(toolTrace, {
+          tool: 'delegation.compile_context',
+          source: config.assistant.delegationContextCompilerV1
+            ? config.openai.apiKey
+              ? 'openai_chat_completions+deterministic_validation'
+              : 'deterministic_fallback'
+            : 'disabled_by_feature_flag',
+          startedAtMs: compilerStartMs,
+          ok: true,
+        });
+
         const derived = deriveDelegationPlan(delegationCommand);
-        const delegationObjective = String(plannerDecision.objective || derived.objective).trim() || derived.objective;
+        const plannerObjective = confirmedDelegationContinuation
+          ? ''
+          : String(plannerDecision.objective || '').trim();
+        const delegationObjective = compiledContext?.objective || plannerObjective || derived.objective;
+        const plannerQuestions = Array.isArray(plannerDecision.questions)
+          ? plannerDecision.questions.map((q) => String(q || '').trim()).filter(Boolean)
+          : [];
+        const plannerQuestionItems: DelegationQuestionItem[] = plannerQuestions.map((text) => ({
+          text,
+          priority: 'PRIMARY',
+        }));
         const delegationQuestions =
-          Array.isArray(plannerDecision.questions) && plannerDecision.questions.length > 0
-            ? plannerDecision.questions
-            : derived.questions;
+          (compiledContext?.questions && compiledContext.questions.length > 0
+            ? compiledContext.questions
+            : plannerQuestions.length > 0
+              ? plannerQuestions
+              : derived.questions
+          ).slice(0, 5);
+        const delegationQuestionItems: DelegationQuestionItem[] =
+          compiledContext?.questionItems && compiledContext.questionItems.length > 0
+            ? compiledContext.questionItems
+            : plannerQuestionItems.length > 0
+              ? plannerQuestionItems
+              : delegationQuestions.map((text) => ({ text, priority: 'PRIMARY' as const }));
+        const delegationType: DelegationType =
+          compiledContext?.delegationType || inferDelegationTypeFromCommand(delegationCommand);
+        const contextPacket: DelegationContextPacket = compiledContext?.contextPacket || {
+          objective: delegationObjective,
+          knownFacts: [],
+          missingFacts: ['Collect unresolved caregiver-requested details from client/family.'],
+          evidence: compilerHistory.slice(-6).map((line) => `[${line.role}] ${line.content}`),
+          model: config.assistant.delegationContextCompilerV1 ? 'deterministic_fallback' : 'feature_flag_disabled',
+          generatedAt: new Date().toISOString(),
+          delegationType,
+          primaryQuestionCount: delegationQuestionItems.filter((q) => q.priority === 'PRIMARY').length,
+          optionalQuestionCount: delegationQuestionItems.filter((q) => q.priority === 'OPTIONAL').length,
+        };
 
         const delegationStartMs = Date.now();
         const startResult = await startDelegationWindow({
@@ -3603,7 +5557,10 @@ Output schema:
           objective: delegationObjective,
           durationMinutes: Number.isFinite(requestedDuration) ? requestedDuration : 30,
           questions: delegationQuestions,
+          questionItems: delegationQuestionItems,
+          delegationType,
           forceStart,
+          contextPacket,
         });
         if (!startResult.ok) {
           recordToolTrace(toolTrace, {
@@ -3637,22 +5594,35 @@ Output schema:
           ok: true,
         });
 
+        const kickoffAskedIndexes = Array.isArray(startResult.delegation.askedQuestionIndexes)
+          ? startResult.delegation.askedQuestionIndexes
+              .map((idx) => Number(idx))
+              .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < startResult.delegation.questions.length)
+          : [];
+        const kickoffQuestionLine =
+          kickoffAskedIndexes.length > 1
+            ? `Initial questions sent: ${kickoffAskedIndexes.map((idx) => startResult.delegation.questions[idx]).join(' | ')}`
+            : startResult.firstQuestion
+              ? `First question sent: ${startResult.firstQuestion}`
+              : 'A kickoff update was sent to the client.';
         const responseText = [
           `Started delegation for ${targetAppointment.clientName}.`,
           `Window: ${formatBusinessDateTime(startResult.delegation.startedAt)} to ${formatBusinessDateTime(startResult.delegation.endsAt)}.`,
-          startResult.firstQuestion
-            ? `First question sent: ${startResult.firstQuestion}`
-            : 'A kickoff update was sent to the client.',
+          kickoffQuestionLine,
         ].join(' ');
+        const disclosedResponseText = appendInferredContextDisclosure(responseText, {
+          inferred: !explicitContextForTurn,
+          appointment: targetAppointment,
+        });
         assistantState = clearAssistantPending(assistantState);
         assistantState = updateAssistantMemoryFromAppointment(assistantState, targetAppointment, parseBusinessDateHint(targetCommand));
-        assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
+        assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', disclosedResponseText);
         await persistAssistantState();
         return res.json({
           success: true,
           data: withToolTrace({
             mode: 'DELEGATION_STARTED',
-            response: responseText,
+            response: disclosedResponseText,
             resolvedAppointment,
             action: {
               type: 'START_DELEGATION',
@@ -3684,6 +5654,9 @@ Output schema:
   app.post('/agents/:userId/delegations/:appointmentId/stop', async (req: Request, res: Response) => {
     try {
       const { userId, appointmentId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const { settings, role } = await getAgentSettings(userId);
       const delegations = settings.delegations || {};
       const delegation = delegations[appointmentId];
@@ -3697,7 +5670,10 @@ Output schema:
       }
 
       const endedAt = new Date().toISOString();
-      const summary = await buildDelegationSummary(appointmentId, delegation.startedAt, endedAt);
+      const summary = await buildDelegationSummary(appointmentId, delegation.startedAt, endedAt, {
+        objective: delegation.objective,
+        questions: delegation.questions || [],
+      });
       const updated: DelegationEntry = {
         ...delegation,
         active: false,
@@ -3734,6 +5710,9 @@ Output schema:
   app.get('/agents/:userId/summaries', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
+      if (!authorizeAgentUserAccess(req, res, userId)) {
+        return;
+      }
       const { settings } = await getAgentSettings(userId);
       const delegations = Object.values(settings.delegations || {});
       const history = settings.summaryHistory || [];

@@ -40,9 +40,11 @@ Stores: `appointment_id nullable`, `client_id`, `caregiver_id`, `confidence`, `r
 
 ## 4. Threading Strategy (Clarity First)
 1. Primary model: one persistent caregiver<->client relationship thread.
+Thread key: `(client_id, caregiver_id)`.
 2. Appointment context is a message-level/tag-level binding, not separate chat windows by default.
 3. Optional appointment-focused sub-view: filter thread by appointment/date.
 4. If needed later: add appointment subthreads for compliance/reporting, but keep user-facing primary thread consistent.
+5. Caregiver reassignment creates or uses a different thread for the new caregiver.
 
 ## 5. Visibility Windows (Fix Current Confusion)
 1. Keep all future appointments in DB and APIs.
@@ -62,6 +64,7 @@ Stores: `appointment_id nullable`, `client_id`, `caregiver_id`, `confidence`, `r
 4. Otherwise choose next upcoming appointment for that caregiver-client pair.
 5. If confidence is low, ask one follow-up question before tool execution.
 6. Always persist resolver decision in `ContextBinding` for traceability.
+7. Resolver must never cross caregiver boundary for retrieval or tool execution.
 
 ## 7. Multi-Channel Integration Framework
 1. Inbound adapters normalize provider payloads to canonical envelope.
@@ -70,6 +73,7 @@ Stores: `appointment_id nullable`, `client_id`, `caregiver_id`, `confidence`, `r
 `parseInbound`, `sendOutbound`, `statusWebhook`, `validateSignature`.
 4. Provider-specific identifiers are stored only in `ChannelMessageLink`.
 5. Business logic consumes only canonical messages and context bindings.
+6. Channel routing must resolve to a caregiver-scoped thread before assistant/tool processing.
 
 ## 8. Canonical Inbound Message Envelope
 1. `external_provider`: `twilio_sms|twilio_whatsapp|email|in_app`
@@ -101,13 +105,16 @@ Stores: `appointment_id nullable`, `client_id`, `caregiver_id`, `confidence`, `r
 ## 11. API Contract Direction
 1. `GET /conversations`
 Returns logical threads with operational/upcoming grouping.
+Response must include only threads where requester is a participant.
 
 2. `GET /conversations/:id/messages`
 Returns canonical messages, optional filters:
 `appointmentId`, `dateFrom`, `dateTo`, `channel`.
+Must enforce thread participant access control.
 
 3. `POST /conversations/:id/messages`
 Creates canonical message and dispatches by preferred channel.
+Must reject writes from non-participants.
 
 4. `POST /webhooks/:provider/inbound`
 Adapter endpoint for Twilio/email/etc, normalizes then writes canonical message.
@@ -129,7 +136,12 @@ global thread search across all dates/channels with context chips.
 
 ## 13. Migration Plan
 1. Phase 1 (now):
-keep existing tables, introduce operational window and explicit context bar in UI.
+keep existing tables and implement caregiver-isolated operational UX now.
+Implement conversation read/write filters so caregiver requests are restricted to `(client_id, caregiver_id)` appointment scope.
+Add default operational visibility window (`today -1` to `today +7`) with collapsed later appointments.
+Add context bar in chat UI showing active client and appointment context source.
+Update assistant retrieval queries to enforce same caregiver scope for all client-info lookups.
+Add explicit context disclosure in assistant responses when appointment/client context is inferred.
 
 2. Phase 2:
 introduce canonical `conversation_threads` and `conversation_messages` abstractions mapped from current `messages`.
@@ -146,6 +158,7 @@ switch assistant tools to canonical conversation store only.
 3. Full audit trail of raw payload and normalized record.
 4. PII-safe logging and redaction.
 5. Deterministic context resolver with explainable reasons.
+6. Strict caregiver isolation for conversation history and assistant retrieval.
 
 ## 15. Immediate Decisions to Lock
 1. Single primary relationship thread per caregiver-client pair.
@@ -153,10 +166,34 @@ switch assistant tools to canonical conversation store only.
 3. Operational visibility window default: `today -1` to `today +7`.
 4. Assistant must include context disclosure when ambiguity exists.
 5. Channel adapters must normalize into one canonical schema before any business logic.
+6. Caregivers cannot access messages from threads owned by other caregivers.
 
-## 16. Open Questions
+## 16. Access Control and Isolation Policy (Mandatory)
+1. A caregiver can read only threads where they are a participant.
+2. Assistant retrieval/tools must include thread scope and caregiver scope in every query.
+3. Client messages are visible to caregiver A only in thread `(client, caregiver A)`.
+4. If a client has a future appointment with caregiver B, caregiver A does not inherit B thread data, and B does not inherit A thread data.
+5. Cross-caregiver continuity is provided only through explicit structured handoff artifacts, not raw chat history.
+
+## 17. Twilio/WhatsApp Inbound Routing Flow (Mandatory)
+1. Receive webhook and validate provider signature.
+2. Enforce idempotency on `provider + provider_message_id`.
+3. Resolve endpoint to client identity.
+4. Determine target caregiver-scoped thread using explicit appointment hint if present and valid.
+5. If explicit hint is absent, choose operational appointment context for that sender endpoint.
+6. If multiple eligible caregiver threads remain, route to coordinator triage.
+7. Write canonical message with resolved thread id and context binding.
+8. Run assistant logic only within resolved thread scope.
+9. Notify only participants of that thread.
+
+## 18. Caregiver Change Handling
+1. When future appointment caregiver differs, use/create a different thread keyed by `(client_id, caregiver_id_new)`.
+2. New caregiver starts with empty chat history in that thread unless explicit handoff summary is attached.
+3. Existing caregiver retains prior thread history but does not receive new thread messages.
+4. Assistant responses must cite which thread/appointment context they used if ambiguity exists.
+
+## 19. Open Questions
 1. Do we need legal/compliance requirement for separate immutable appointment transcripts?
 2. Can one client choose multiple simultaneous channels, and if so what is channel priority?
 3. Should coordinator messages be in the same thread or a separate internal-only layer?
 4. What is acceptable delay for webhook-to-message availability SLA?
-

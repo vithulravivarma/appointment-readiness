@@ -1,5 +1,6 @@
 import { Message } from '@aws-sdk/client-sqs';
 import { subscribeToQueue, MessageHandler } from './sqs';
+import { QUEUES } from '@ar/types';
 
 /**
  * Placeholder handler for ingestion messages
@@ -56,6 +57,6 @@ export async function handleIngestion(message: Message): Promise<void> {
  * Initialize SQS consumers for ingestion-service
  */
 export async function initializeConsumers(sqsClient: ReturnType<typeof import('./sqs').initializeSQS>): Promise<void> {
-  // Subscribe to ingestion-queue
-  await subscribeToQueue(sqsClient, 'ingestion-queue', handleIngestion);
+  // Subscribe to ingestion queue
+  await subscribeToQueue(sqsClient, QUEUES.INGESTION, handleIngestion);
 }

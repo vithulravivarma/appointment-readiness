@@ -9,17 +9,9 @@ echo "✅ Docker is running in the background."
 echo "⏳ Waiting 10 seconds for LocalStack to initialize..."
 sleep 10
 
-# 3. Create the Queues (The Infrastructure)
-echo "📢 Creating ALL SQS Queues..."
-
-# --- A. The "Foundational" Queues (From your original design) ---
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name incoming-messages-queue
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name readiness-updates-queue
-
-# --- B. The "Service-Specific" Queues (From your error logs) ---
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name brief-generation-queue
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name notification-queue
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name readiness-evaluation-queue
+# 3. Create queues with DLQ redrive defaults
+echo "📢 Creating SQS queues + DLQs..."
+./scripts/setup-local.sh
 
 # Function to open a new terminal tab and run a command
 open_tab() {

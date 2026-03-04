@@ -4,11 +4,18 @@ import {
   QUEUES,
   ReadinessEvaluationEvent,
   NotificationJob,
+  resolvePrecheckProfile,
+  type PrecheckCheckType,
 } from '@ar/types';
-import { subscribeToQueue, publishMessage } from './sqs';
+import { NonRetryableMessageError, subscribeToQueue, publishMessage } from './sqs';
 // Make sure updateCheckStatus is imported from your repository
 import { ensureChecklistExists, getReadinessState, updateReadinessStatus, updateCheckStatus } from './repository';
 import { evaluateReadiness } from './logic';
+import {
+  buildPersistentIdempotencyKey,
+  hasPersistentProcessedMessage,
+  markPersistentProcessedMessage,
+} from './idempotency-store';
 
 // Define the shape of the message coming from Phase 3 AI
 interface AIUpdateEvent {
@@ -26,154 +33,72 @@ interface PrecheckCandidate {
   startTime: string;
   serviceType: string | null;
 }
-
-type PrecheckCheckType = 'ACCESS_CONFIRMED' | 'MEDS_SUPPLIES_READY' | 'CARE_PLAN_CURRENT';
-
-type LocalPrecheckQuestion = {
-  checkType: PrecheckCheckType;
-  prompt: string;
-  passSignals: string[];
-  failSignals: string[];
-};
-
-type LocalPrecheckProfile = {
-  id: 'HOME_CARE' | 'TRADES' | 'CLINICAL';
-  objective: string;
-  matchKeywords: string[];
-  questions: LocalPrecheckQuestion[];
-};
-
-const LOCAL_PRECHECK_PROFILES: LocalPrecheckProfile[] = [
-  {
-    id: 'HOME_CARE',
-    objective: 'Complete pre-readiness checklist and escalate unresolved blockers.',
-    matchKeywords: ['aba', 'home care', 'caregiving', 'family support', 'therapy'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Has the way to access your home changed since the last visit? If not, how should the caregiver access it today (code/key/door)?',
-        passSignals: ['code', 'key', 'unlock', 'unlocked', 'entry confirmed', 'access confirmed'],
-        failSignals: ['no code', 'no key', 'cant enter', 'cannot enter', 'locked out', 'gate locked'],
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required medications and supplies ready for the visit?',
-        passSignals: ['meds ready', 'medications ready', 'supplies ready', 'prepared', 'available', 'set up'],
-        failSignals: ['out of', 'missing', 'not ready', 'no meds', 'no supplies', 'need refill'],
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Have there been any updates to visit instructions since last time? If none, just say "no updates".',
-        passSignals: ['care plan updated', 'instructions updated', 'plan current', 'same plan', 'confirmed instructions', 'no updates'],
-        failSignals: ['no plan', 'outdated', 'not sure', 'unclear instructions', 'need updated plan'],
-      },
-    ],
-  },
-  {
-    id: 'TRADES',
-    objective: 'Complete pre-arrival checklist for the trade visit and escalate unresolved blockers.',
-    matchKeywords: ['plumb', 'hvac', 'electri', 'repair', 'installation', 'trade', 'contractor'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Can the technician access the work area when they arrive (entry code, gate, parking, on-site contact)?',
-        passSignals: ['access confirmed', 'entry confirmed', 'gate open', 'parking available', 'onsite contact'],
-        failSignals: ['no access', 'no gate code', 'cant enter', 'cannot enter', 'no parking', 'not home'],
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required materials/equipment available on-site, or should the technician bring everything?',
-        passSignals: ['materials ready', 'equipment ready', 'bring everything', 'all set', 'available onsite'],
-        failSignals: ['missing parts', 'no materials', 'not available', 'need parts', 'backorder'],
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Has the job scope changed since the last visit? If nothing changed, just say "no updates".',
-        passSignals: ['scope unchanged', 'same scope', 'updated scope shared', 'details confirmed', 'no updates'],
-        failSignals: ['scope changed', 'new issue', 'unclear scope', 'not sure on details'],
-      },
-    ],
-  },
-  {
-    id: 'CLINICAL',
-    objective: 'Complete appointment readiness checks and escalate unresolved clinical-visit blockers.',
-    matchKeywords: ['dental', 'dentist', 'clinic', 'clinical', 'hygiene', 'orthodont'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Is clinic access/arrival logistics confirmed (transport, check-in timing, and location details)?',
-        passSignals: ['transport confirmed', 'arrival confirmed', 'check in confirmed', 'location confirmed'],
-        failSignals: ['no transport', 'running late', 'wrong location', 'cant make it'],
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required documents/medications/items ready for the appointment (ID, forms, med list, etc.)?',
-        passSignals: ['documents ready', 'forms ready', 'med list ready', 'everything ready'],
-        failSignals: ['missing documents', 'forms not done', 'forgot id', 'not ready'],
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Are there any new updates the clinic team should know before the visit? If none, just say "no updates".',
-        passSignals: ['no updates', 'updates shared', 'plan current', 'instructions current'],
-        failSignals: ['new symptoms', 'new issue', 'plan changed', 'need to update'],
-      },
-    ],
-  },
-];
 const BUSINESS_TIME_ZONE = 'America/Los_Angeles';
-
-function resolveLocalPrecheckProfile(serviceType?: string | null): LocalPrecheckProfile {
-  const value = String(serviceType || '').toLowerCase();
-  for (const profile of LOCAL_PRECHECK_PROFILES) {
-    if (profile.matchKeywords.some((keyword) => value.includes(keyword))) {
-      return profile;
-    }
-  }
-  return LOCAL_PRECHECK_PROFILES[0];
-}
+const READINESS_EVALUATION_CONSUMER = 'readiness-engine.readiness-evaluation';
+const READINESS_UPDATES_CONSUMER = 'readiness-engine.readiness-updates';
 
 export async function handleReadinessEvaluation(
   message: Message, 
   sqsClient: SQSClient,
   pool: Pool 
 ): Promise<void> {
-  if (!message.Body) return;
-
-  try {
-    const event = JSON.parse(message.Body) as ReadinessEvaluationEvent;
-    console.log(`[HANDLER] Processing ${event.appointmentId} (Trigger: ${event.trigger})`);
-
-    // 1. Ensure checks exist
-    await ensureChecklistExists(pool, event.appointmentId);
-
-    // 2. Get current state
-    const currentState = await getReadinessState(pool, event.appointmentId);
-
-    // 3. Run rules
-    const result = evaluateReadiness(currentState);
-
-    // 4. Save result if changed
-    if (result.nextStatus !== currentState.status) {
-      await updateReadinessStatus(pool, event.appointmentId, result.nextStatus, result.riskScore);
-      console.log(`[DB] Updated status to ${result.nextStatus}`);
-    }
-
-    // 5. Notify
-    if (result.shouldNotify) {
-      const notification: NotificationJob = {
-        type: 'SMS',
-        recipient: '+15550000000',
-        templateId: result.nextStatus === 'BLOCKED' ? 'ESCALATION_ALERT' : 'READY_CONFIRMATION',
-        data: { appointmentId: event.appointmentId, status: result.nextStatus }
-      };
-      await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
-    }
-
-    await kickoffPendingPrecheckConversations(pool);
-
-  } catch (error) {
-    console.error('[HANDLER] Failed to process message', error);
+  if (!message.Body) {
+    throw new NonRetryableMessageError('Missing message body', 'MISSING_BODY');
   }
+  let event: ReadinessEvaluationEvent;
+  try {
+    event = JSON.parse(message.Body) as ReadinessEvaluationEvent;
+  } catch {
+    throw new NonRetryableMessageError('Invalid JSON for readiness evaluation event', 'INVALID_JSON');
+  }
+  if (!String(event?.appointmentId || '').trim()) {
+    throw new NonRetryableMessageError('Readiness evaluation event missing appointmentId', 'MISSING_APPOINTMENT_ID');
+  }
+  const key = buildPersistentIdempotencyKey(READINESS_EVALUATION_CONSUMER, QUEUES.READINESS_EVALUATION, message);
+  if (!key) {
+    throw new NonRetryableMessageError('Readiness evaluation event missing MessageId', 'MISSING_MESSAGE_ID');
+  }
+  if (await hasPersistentProcessedMessage(pool, key)) {
+    console.log('[HANDLER] Skipping duplicate readiness evaluation event via persistent idempotency key', {
+      appointmentId: event.appointmentId,
+      messageId: message.MessageId,
+    });
+    return;
+  }
+
+  console.log(`[HANDLER] Processing ${event.appointmentId} (Trigger: ${event.trigger})`);
+
+  // 1. Ensure checks exist
+  await ensureChecklistExists(pool, event.appointmentId);
+
+  // 2. Get current state
+  const currentState = await getReadinessState(pool, event.appointmentId);
+
+  // 3. Run rules
+  const result = evaluateReadiness(currentState);
+
+  // 4. Save result if changed
+  if (result.nextStatus !== currentState.status) {
+    await updateReadinessStatus(pool, event.appointmentId, result.nextStatus, result.riskScore);
+    console.log(`[DB] Updated status to ${result.nextStatus}`);
+  }
+
+  // 5. Notify
+  if (result.shouldNotify) {
+    const notification: NotificationJob = {
+      type: 'SMS',
+      recipient: '+15550000000',
+      templateId: result.nextStatus === 'BLOCKED' ? 'ESCALATION_ALERT' : 'READY_CONFIRMATION',
+      data: { appointmentId: event.appointmentId, status: result.nextStatus }
+    };
+    await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
+  }
+
+  await kickoffPendingPrecheckConversations(pool);
+  await markPersistentProcessedMessage(pool, key, 'SUCCEEDED', {
+    appointmentId: event.appointmentId,
+    trigger: event.trigger,
+  });
 }
 
 // --- INITIALIZATION ---
@@ -200,54 +125,84 @@ export async function initializeConsumers(sqsClient: SQSClient, pool: Pool): Pro
 
 // --- PHASE 3 HANDLER (Updated for Chat Workflow) ---
 export async function handleAISignal(message: Message, sqsClient: SQSClient, pool: Pool): Promise<void> {
-  if (!message.Body) return;
-
-  try {
-    const body = JSON.parse(message.Body);
-    
-    // We only care about the specific UPDATE_CHECK event from the AI
-    if (body.type === 'UPDATE_CHECK') {
-      const event = body as AIUpdateEvent;
-      console.log(`[HANDLERS] 🤖 AI Update: Setting ${event.checkType} to ${event.status} for ${event.appointmentId}`);
-
-      // Ensure rows exist before applying AI updates to avoid dropped updates.
-      await ensureChecklistExists(pool, event.appointmentId);
-
-      // 1. DB: Update the specific check (e.g., ACCESS_CODE)
-      // This is more precise than resolving *all* checks
-      await updateCheckStatus(pool, event.appointmentId, event.checkType, event.status);
-
-      // 2. DB: Get the new state (refresh everything)
-      const newState = await getReadinessState(pool, event.appointmentId);
-
-      // 3. LOGIC: Re-evaluate the Score (Does this specific fix make the whole appt READY?)
-      const result = evaluateReadiness(newState);
-
-      // 4. DB: Update the parent status if it changed
-      if (result.nextStatus !== newState.status) {
-        await updateReadinessStatus(pool, event.appointmentId, result.nextStatus, result.riskScore);
-        console.log(`[DB] 🔄 State transition: ${newState.status} -> ${result.nextStatus}`);
-
-        // 5. NOTIFY: If we just turned Green
-        if (result.nextStatus === 'READY') {
-          const notification: NotificationJob = {
-            type: 'SMS',
-            recipient: '+15550000000',
-            templateId: 'READY_CONFIRMATION',
-            data: { appointmentId: event.appointmentId, status: 'READY' }
-          };
-          await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
-        }
-      }
-
-      await kickoffPendingPrecheckConversations(pool);
-    } else {
-        console.log(`[HANDLERS] Ignored unknown event type: ${body.type}`);
-    }
-
-  } catch (error) {
-    console.error('[HANDLERS] Failed to process AI signal', error);
+  if (!message.Body) {
+    throw new NonRetryableMessageError('Missing message body', 'MISSING_BODY');
   }
+  let body: any;
+  try {
+    body = JSON.parse(message.Body);
+  } catch {
+    throw new NonRetryableMessageError('Invalid JSON for AI signal event', 'INVALID_JSON');
+  }
+  const key = buildPersistentIdempotencyKey(READINESS_UPDATES_CONSUMER, QUEUES.READINESS_UPDATES, message);
+  if (!key) {
+    throw new NonRetryableMessageError('AI signal event missing MessageId', 'MISSING_MESSAGE_ID');
+  }
+  if (await hasPersistentProcessedMessage(pool, key)) {
+    console.log('[HANDLERS] Skipping duplicate AI signal via persistent idempotency key', {
+      messageId: message.MessageId,
+    });
+    return;
+  }
+  
+  // We only care about the specific UPDATE_CHECK event from the AI
+  if (body.type !== 'UPDATE_CHECK') {
+    console.log(`[HANDLERS] Ignored unknown event type: ${String(body.type || 'unknown')}`);
+    await markPersistentProcessedMessage(pool, key, 'SUCCEEDED', {
+      ignoredType: String(body.type || 'unknown'),
+    });
+    return;
+  }
+
+  const event = body as AIUpdateEvent;
+  if (!String(event.appointmentId || '').trim()) {
+    throw new NonRetryableMessageError('AI signal missing appointmentId', 'MISSING_APPOINTMENT_ID');
+  }
+  if (!String(event.checkType || '').trim()) {
+    throw new NonRetryableMessageError('AI signal missing checkType', 'MISSING_CHECK_TYPE');
+  }
+  if (event.status !== 'PASS' && event.status !== 'FAIL') {
+    throw new NonRetryableMessageError('AI signal status must be PASS or FAIL', 'INVALID_STATUS');
+  }
+
+  console.log(`[HANDLERS] 🤖 AI Update: Setting ${event.checkType} to ${event.status} for ${event.appointmentId}`);
+
+  // Ensure rows exist before applying AI updates to avoid dropped updates.
+  await ensureChecklistExists(pool, event.appointmentId);
+
+  // 1. DB: Update the specific check (e.g., ACCESS_CODE)
+  // This is more precise than resolving *all* checks
+  await updateCheckStatus(pool, event.appointmentId, event.checkType, event.status);
+
+  // 2. DB: Get the new state (refresh everything)
+  const newState = await getReadinessState(pool, event.appointmentId);
+
+  // 3. LOGIC: Re-evaluate the Score (Does this specific fix make the whole appt READY?)
+  const result = evaluateReadiness(newState);
+
+  // 4. DB: Update the parent status if it changed
+  if (result.nextStatus !== newState.status) {
+    await updateReadinessStatus(pool, event.appointmentId, result.nextStatus, result.riskScore);
+    console.log(`[DB] 🔄 State transition: ${newState.status} -> ${result.nextStatus}`);
+
+    // 5. NOTIFY: If we just turned Green
+    if (result.nextStatus === 'READY') {
+      const notification: NotificationJob = {
+        type: 'SMS',
+        recipient: '+15550000000',
+        templateId: 'READY_CONFIRMATION',
+        data: { appointmentId: event.appointmentId, status: 'READY' }
+      };
+      await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
+    }
+  }
+
+  await kickoffPendingPrecheckConversations(pool);
+  await markPersistentProcessedMessage(pool, key, 'SUCCEEDED', {
+    appointmentId: event.appointmentId,
+    checkType: event.checkType,
+    status: event.status,
+  });
 }
 
 async function kickoffPendingPrecheckConversations(pool: Pool): Promise<void> {
@@ -413,7 +368,7 @@ async function startPrecheckConversation(pool: Pool, candidate: PrecheckCandidat
       return false;
     }
 
-    const profile = resolveLocalPrecheckProfile(candidate.serviceType);
+    const profile = resolvePrecheckProfile(candidate.serviceType);
     const when = new Date(candidate.startTime).toLocaleString('en-US', {
       timeZone: BUSINESS_TIME_ZONE,
       month: 'short',
@@ -498,8 +453,6 @@ async function startPrecheckConversation(pool: Pool, candidate: PrecheckCandidat
         acc[key] = {
           question: q.prompt,
           status: 'PENDING',
-          passSignals: q.passSignals,
-          failSignals: q.failSignals,
           ...(idx === 0 ? { askedAt: new Date().toISOString() } : {}),
         };
         return acc;

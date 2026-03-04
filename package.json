@@ -8,8 +8,10 @@
   "scripts": {
     "dev:readiness": "npm run dev --workspace=services/readiness-engine",
     "migrate": "ts-node scripts/migrate.ts",
+    "backfill:agent-desk": "ts-node scripts/backfill-agent-desk-history.ts",
     "test": "jest",
     "smoke": "./scripts/e2e-smoke.sh",
+    "test:isolation": "bash ./scripts/e2e-chat-isolation.sh",
     "infra:up": "docker-compose up -d",
     "infra:down": "docker-compose down",
     "setup": "./scripts/setup-local.sh"

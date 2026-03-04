@@ -70,6 +70,11 @@ Standardized response envelope (extends current shape, backward compatible):
 ```
 
 `toolTrace` is optional for compatibility and should be progressively added.
+`chatMessageId` is included when the assistant response is persisted to Agent Desk history (`agent_desk_messages`).
+
+Agent Desk history API:
+- `GET /agents/:userId/chat/history?limit=<n>&before=<iso>`
+- Returns newest-first persisted caregiver/assistant thread entries for Agent Desk.
 
 ## Tool Catalog
 
@@ -430,4 +435,3 @@ Command endpoint behavior:
 4. Add `weather.get_hourly` and `weather.assess_visit_risk`.
 5. Add `context.day_brief` composer path for blended route+weather answers.
 6. Add tests for fallback behavior (maps/weather down).
-

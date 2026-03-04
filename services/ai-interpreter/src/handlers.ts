@@ -1,10 +1,39 @@
 // services/ai-interpreter-service/src/handlers.ts
+import crypto from 'crypto';
 import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand, SendMessageCommand, GetQueueUrlCommand, Message } from '@aws-sdk/client-sqs';
 import { Pool } from 'pg';
 import OpenAI from 'openai';
-import { QUEUES } from '@ar/types';
+import {
+  QUEUES,
+  getDefaultPrecheckProfile,
+  resolvePrecheckProfile,
+  type PrecheckCheckType,
+} from '@ar/types';
+import {
+  isSystemManagedDelegationEntry,
+  pickForcedQuestion,
+  shouldWritePrecheckSummaryToDelegation,
+} from './delegation-policy';
+import { buildPrecheckCompletionSummary } from './precheck-summary-policy';
+import {
+  buildPersistentIdempotencyKey,
+  hasPersistentProcessedMessage,
+  markPersistentProcessedMessage,
+} from './idempotency-store';
+import {
+  evaluateDelegationCompletion,
+  formatDelegationProgressUpdate,
+  formatDelegationCompletionUpdate,
+} from './delegation-completion-policy';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const DELEGATION_COMPLETION_NOTIFY_V1 = ['1', 'true', 'yes'].includes(
+  String(process.env.ASSISTANT_DELEGATION_COMPLETION_NOTIFY_V1 || 'true').toLowerCase(),
+);
+const DELEGATION_PROGRESS_NOTIFY_V1 = ['1', 'true', 'yes'].includes(
+  String(process.env.ASSISTANT_DELEGATION_PROGRESS_NOTIFY_V1 || 'true').toLowerCase(),
+);
 
 type ReadinessPolicy = {
   minConfidence: number;
@@ -25,122 +54,98 @@ function loadReadinessPolicy(): ReadinessPolicy {
 
 const READINESS_POLICY = loadReadinessPolicy();
 
-function normalizeText(text: string): string {
-  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+class NonRetryableMessageError extends Error {
+  public readonly code: string;
+
+  constructor(message: string, code: string = 'NON_RETRYABLE_MESSAGE') {
+    super(message);
+    this.name = 'NonRetryableMessageError';
+    this.code = code;
+  }
 }
 
-function tokenize(text: string): string[] {
-  const stop = new Set(['the', 'a', 'an', 'is', 'are', 'to', 'of', 'for', 'and', 'or', 'on', 'in', 'at', 'any', 'there', 'with', 'you', 'your']);
-  return normalizeText(text)
-    .split(/\s+/)
-    .filter((w) => w.length > 2 && !stop.has(w));
-}
-
-function looksLikeNonClientOwnedQuestion(text: string): boolean {
-  const v = normalizeText(text);
-  return (
-    v.includes('caregiver') ||
-    v.includes('provider') ||
-    v.includes('our schedule') ||
-    v.includes('my schedule') ||
-    v.includes('dispatch') ||
-    v.includes('route')
-  );
-}
-
-function questionLikelyAnswered(question: string, familyMessage: string): boolean {
-  const qTokens = tokenize(question);
-  const answer = normalizeText(familyMessage);
-  if (qTokens.length === 0) return familyMessage.trim().length > 0;
-  const matches = qTokens.filter((t) => answer.includes(t)).length;
-  return matches >= Math.max(1, Math.floor(qTokens.length / 3));
-}
-
-type PlannerCheckType = 'ACCESS_CONFIRMED' | 'MEDS_SUPPLIES_READY' | 'CARE_PLAN_CURRENT';
-type PlannerStatus = 'PENDING' | 'PASS' | 'FAIL';
-type ReadinessCategory = PlannerCheckType | 'CAREGIVER_MATCH_CONFIRMED';
-
-type LocalPrecheckQuestion = {
-  checkType: PlannerCheckType;
-  prompt: string;
+type ConsumerReliabilityOptions = {
+  waitTimeSeconds: number;
+  pollErrorBackoffMs: number;
+  idempotencyTtlMs: number;
+  idempotencyMaxKeys: number;
 };
 
-type LocalPrecheckProfile = {
-  id: 'HOME_CARE' | 'TRADES' | 'CLINICAL';
-  matchKeywords: string[];
-  questions: LocalPrecheckQuestion[];
-};
+const processedMessageCache = new Map<string, number>();
 
-const LOCAL_PRECHECK_PROFILES: LocalPrecheckProfile[] = [
-  {
-    id: 'HOME_CARE',
-    matchKeywords: ['aba', 'home care', 'caregiving', 'family support', 'therapy'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Has the way to access your home changed since the last visit? If not, how should the caregiver access it today (code/key/door)?',
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required medications and supplies ready for the visit?',
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Have there been any updates to visit instructions since last time? If none, just say "no updates".',
-      },
-    ],
-  },
-  {
-    id: 'TRADES',
-    matchKeywords: ['plumb', 'hvac', 'electri', 'repair', 'installation', 'trade', 'contractor'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Can the technician access the work area when they arrive (entry code, gate, parking, on-site contact)?',
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required materials/equipment available on-site, or should the technician bring everything?',
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Has the job scope changed since the last visit? If nothing changed, just say "no updates".',
-      },
-    ],
-  },
-  {
-    id: 'CLINICAL',
-    matchKeywords: ['dental', 'dentist', 'clinic', 'clinical', 'hygiene', 'orthodont'],
-    questions: [
-      {
-        checkType: 'ACCESS_CONFIRMED',
-        prompt: 'Is clinic access/arrival logistics confirmed (transport, check-in timing, and location details)?',
-      },
-      {
-        checkType: 'MEDS_SUPPLIES_READY',
-        prompt: 'Are required documents/medications/items ready for the appointment (ID, forms, med list, etc.)?',
-      },
-      {
-        checkType: 'CARE_PLAN_CURRENT',
-        prompt: 'Are there any new updates the clinic team should know before the visit? If none, just say "no updates".',
-      },
-    ],
-  },
-];
-
-function getDefaultLocalProfile(): LocalPrecheckProfile {
-  return LOCAL_PRECHECK_PROFILES[0];
+function parseIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name] || fallback);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(raw)));
 }
 
-function resolveLocalPrecheckProfile(serviceType?: string | null): LocalPrecheckProfile {
-  const value = String(serviceType || '').toLowerCase();
-  for (const profile of LOCAL_PRECHECK_PROFILES) {
-    if (profile.matchKeywords.some((keyword) => value.includes(keyword))) {
-      return profile;
+function loadConsumerReliabilityOptions(): ConsumerReliabilityOptions {
+  return {
+    waitTimeSeconds: parseIntEnv('SQS_POLL_WAIT_SECONDS', 20, 1, 20),
+    pollErrorBackoffMs: parseIntEnv('SQS_POLL_ERROR_BACKOFF_MS', 5000, 250, 60000),
+    idempotencyTtlMs: parseIntEnv('SQS_IDEMPOTENCY_TTL_MS', 30 * 60 * 1000, 1000, 24 * 60 * 60 * 1000),
+    idempotencyMaxKeys: parseIntEnv('SQS_IDEMPOTENCY_MAX_KEYS', 20000, 100, 500000),
+  };
+}
+
+const CONSUMER_RELIABILITY = loadConsumerReliabilityOptions();
+const INCOMING_MESSAGES_CONSUMER = 'ai-interpreter.incoming-messages';
+
+function nowMs(): number {
+  return Date.now();
+}
+
+function cleanupProcessedMessageCache(ttlMs: number, maxKeys: number): void {
+  const cutoff = nowMs() - ttlMs;
+  for (const [key, seenAtMs] of processedMessageCache.entries()) {
+    if (seenAtMs < cutoff) {
+      processedMessageCache.delete(key);
     }
   }
-  return getDefaultLocalProfile();
+
+  if (processedMessageCache.size <= maxKeys) return;
+  const entries = Array.from(processedMessageCache.entries()).sort((a, b) => a[1] - b[1]);
+  const dropCount = processedMessageCache.size - maxKeys;
+  for (let i = 0; i < dropCount; i += 1) {
+    processedMessageCache.delete(entries[i][0]);
+  }
 }
+
+function buildIdempotencyKey(queueName: string, message: Message): string {
+  const messageId = String(message.MessageId || '').trim() || 'unknown-message-id';
+  const bodyHash = crypto
+    .createHash('sha1')
+    .update(String(message.Body || ''))
+    .digest('hex')
+    .slice(0, 16);
+  return `${queueName}:${messageId}:${bodyHash}`;
+}
+
+function hasProcessedRecently(key: string, ttlMs: number): boolean {
+  const seenAtMs = processedMessageCache.get(key);
+  if (!seenAtMs) return false;
+  return nowMs() - seenAtMs <= ttlMs;
+}
+
+function rememberProcessed(key: string): void {
+  processedMessageCache.set(key, nowMs());
+}
+
+function parseReceiveCount(message: Message): number {
+  const raw = Number(message.Attributes?.ApproximateReceiveCount || '1');
+  if (!Number.isFinite(raw)) return 1;
+  return Math.max(1, Math.trunc(raw));
+}
+
+function isNonRetryableHandlerError(error: unknown): boolean {
+  if (error instanceof NonRetryableMessageError) return true;
+  if (error instanceof SyntaxError) return true;
+  return false;
+}
+
+type PlannerCheckType = PrecheckCheckType;
+type PlannerStatus = 'PENDING' | 'PASS' | 'FAIL';
+type ReadinessCategory = PlannerCheckType | 'CAREGIVER_MATCH_CONFIRMED';
 
 interface ChecklistPlannerItem {
   question: string;
@@ -163,7 +168,7 @@ const CHECKLIST_ORDER: PlannerCheckType[] = [
 ];
 
 function createDefaultPlannerState(): ChecklistPlannerState {
-  const profile = getDefaultLocalProfile();
+  const profile = getDefaultPrecheckProfile();
   const byCheck = new Map(profile.questions.map((q) => [q.checkType, q]));
   return {
     version: 1,
@@ -309,7 +314,7 @@ function hydratePlannerState(
   planner: ChecklistPlannerState,
   serviceType?: string | null,
 ): ChecklistPlannerState {
-  const profile = resolveLocalPrecheckProfile(serviceType);
+  const profile = resolvePrecheckProfile(serviceType);
   const byCheck = new Map(profile.questions.map((q) => [q.checkType, q]));
   const next = JSON.parse(JSON.stringify(planner)) as ChecklistPlannerState;
   next.profileId = next.profileId || profile.id;
@@ -437,6 +442,153 @@ async function buildConversationContext(
   return lines.join('\n');
 }
 
+type DelegationQuestionAssessment = {
+  index: number;
+  answered: boolean;
+  askable: boolean;
+  confidence: number;
+};
+
+type DelegationQuestionPriority = 'PRIMARY' | 'OPTIONAL';
+type DelegationQuestionItem = {
+  text: string;
+  priority: DelegationQuestionPriority;
+};
+
+type NormalizedDelegationQuestions = {
+  questions: string[];
+  questionItems: DelegationQuestionItem[];
+  primaryIndexes: number[];
+  optionalIndexes: number[];
+};
+
+function normalizeDelegationQuestions(entry: any): NormalizedDelegationQuestions {
+  const rawItems: unknown[] = Array.isArray(entry?.questionItems) ? entry.questionItems : [];
+  const fromItems: DelegationQuestionItem[] = rawItems
+    .map((row) => {
+      if (!row || typeof row !== 'object') return null;
+      const item = row as Record<string, unknown>;
+      const text = String(item.text || '').trim();
+      if (!text) return null;
+      const priority = String(item.priority || '').trim().toUpperCase() === 'OPTIONAL' ? 'OPTIONAL' : 'PRIMARY';
+      return { text, priority } as DelegationQuestionItem;
+    })
+    .filter((row): row is DelegationQuestionItem => Boolean(row));
+  const rawQuestions: unknown[] = Array.isArray(entry?.questions) ? entry.questions : [];
+  const fallback = rawQuestions
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .map((text) => ({ text, priority: 'PRIMARY' as const }));
+  const questionItems = fromItems.length > 0 ? fromItems : fallback;
+  const questions = questionItems.map((item) => item.text);
+  const rawPrimary = normalizeDelegationIndexList(entry?.primaryQuestionIndexes, questions.length);
+  const primaryIndexes = rawPrimary.length > 0
+    ? rawPrimary
+    : questionItems
+        .map((item, idx) => (item.priority === 'PRIMARY' ? idx : -1))
+        .filter((idx) => idx >= 0);
+  const safePrimaryIndexes = primaryIndexes.length > 0
+    ? primaryIndexes
+    : (questions.length > 0 ? [0] : []);
+  const rawOptional = normalizeDelegationIndexList(entry?.optionalQuestionIndexes, questions.length);
+  const optionalIndexes = rawOptional.length > 0
+    ? rawOptional
+    : questionItems
+        .map((item, idx) => (item.priority === 'OPTIONAL' ? idx : -1))
+        .filter((idx) => idx >= 0);
+
+  return {
+    questions,
+    questionItems,
+    primaryIndexes: safePrimaryIndexes,
+    optionalIndexes,
+  };
+}
+
+function normalizeDelegationQuestionAssessment(
+  raw: any,
+  questionCount: number,
+): DelegationQuestionAssessment | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const index = Number(raw.index);
+  if (!Number.isInteger(index) || index < 0 || index >= questionCount) return null;
+  const answered = Boolean(raw.answered);
+  const askable = Boolean(raw.askable);
+  const confidenceRaw = Number(raw.confidence);
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.max(0, Math.min(1, confidenceRaw))
+    : 0.5;
+  return {
+    index,
+    answered,
+    askable,
+    confidence,
+  };
+}
+
+async function assessDelegationQuestionsWithLLM(input: {
+  questions: string[];
+  latestMessage: string;
+  conversationContext: string;
+}): Promise<DelegationQuestionAssessment[] | null> {
+  if (!process.env.OPENAI_API_KEY || input.questions.length === 0) {
+    return null;
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      response_format: { type: 'json_object' },
+      temperature: 0,
+      messages: [
+        {
+          role: 'system',
+          content: `Return valid JSON only.
+
+Assess delegation questions against the latest client-side message.
+For each question index provided, determine:
+- answered: whether the latest client-side message materially answers the question.
+- askable: whether the question is appropriate for a client/family participant to answer.
+- confidence: 0 to 1.
+
+Do not use keyword heuristics; infer from semantics and context.
+Return:
+{
+  "assessments": [
+    { "index": 0, "answered": false, "askable": true, "confidence": 0.8 }
+  ]
+}`,
+        },
+        {
+          role: 'user',
+          content: [
+            `Questions (0-based):`,
+            input.questions.map((q, idx) => `${idx}: ${q}`).join('\n'),
+            '',
+            `Latest message: ${input.latestMessage}`,
+            '',
+            `Recent conversation:`,
+            input.conversationContext || '(none)',
+          ].join('\n'),
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    if (!content) return null;
+    const parsed = JSON.parse(content);
+    const rawAssessments: unknown[] = Array.isArray(parsed?.assessments) ? parsed.assessments : [];
+    const normalized = rawAssessments
+      .map((item) => normalizeDelegationQuestionAssessment(item, input.questions.length))
+      .filter((item): item is DelegationQuestionAssessment => Boolean(item));
+    if (normalized.length === 0) return null;
+    return normalized;
+  } catch (error) {
+    console.error('[AI] Delegation assessment failed', error);
+    return null;
+  }
+}
+
 async function isSystemPrecheckActive(pool: Pool, appointmentId: string): Promise<boolean> {
   const res = await pool.query(
     `
@@ -466,10 +618,184 @@ async function isSystemPrecheckActive(pool: Pool, appointmentId: string): Promis
   return row.status === 'SCHEDULED' && Boolean(row.started) && !Boolean(row.completed);
 }
 
+function buildDelegationCompletionDedupeKey(input: {
+  appointmentId: string;
+  startedAt?: string;
+}): string {
+  const startedAt = String(input.startedAt || '').trim() || 'unknown-start';
+  return `delegation-complete:${input.appointmentId}:${startedAt}`;
+}
+
+function buildDelegationProgressDedupeKey(input: {
+  appointmentId: string;
+  startedAt?: string;
+  resolvedPrimaryIndexes: number[];
+}): string {
+  const startedAt = String(input.startedAt || '').trim() || 'unknown-start';
+  const resolved = [...input.resolvedPrimaryIndexes]
+    .map((idx) => Number(idx))
+    .filter((idx) => Number.isInteger(idx) && idx >= 0)
+    .sort((a, b) => a - b)
+    .join(',');
+  const token = resolved || 'none';
+  return `delegation-progress:${input.appointmentId}:${startedAt}:${token}`;
+}
+
+function normalizeDelegationIndexList(values: unknown, questionCount: number): number[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value < questionCount)
+    .filter((value, idx, arr) => arr.indexOf(value) === idx)
+    .sort((a, b) => a - b);
+}
+
+let agentDeskSchemaUnavailable = false;
+let agentDeskSchemaWarned = false;
+
+function isUndefinedTableError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = String((error as any).code || '').trim();
+  if (code === '42P01') return true;
+  const message = String((error as any).message || '').toLowerCase();
+  return message.includes('does not exist') && message.includes('agent_desk_');
+}
+
+function isAgentDeskAppointmentForeignKeyError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = String((error as any).code || '').trim();
+  if (code !== '23503') return false;
+  const constraint = String((error as any).constraint || '').trim();
+  if (constraint === 'agent_desk_messages_appointment_id_fkey') return true;
+  const message = String((error as any).message || '').toLowerCase();
+  return message.includes('agent_desk_messages_appointment_id_fkey');
+}
+
+function markAgentDeskSchemaUnavailable(reason: string): void {
+  agentDeskSchemaUnavailable = true;
+  if (agentDeskSchemaWarned) return;
+  agentDeskSchemaWarned = true;
+  console.warn('[AI] Agent desk completion notifications disabled because schema is unavailable', {
+    reason,
+    expectedTables: ['agent_desk_threads', 'agent_desk_messages'],
+    recovery: 'Run migrations and restart services.',
+  });
+}
+
+async function ensureAgentDeskThread(pool: Pool, caregiverId: string): Promise<string | null> {
+  if (agentDeskSchemaUnavailable) return null;
+  try {
+    const existing = await pool.query(
+      `
+        SELECT id::text
+        FROM agent_desk_threads
+        WHERE caregiver_id = $1
+        LIMIT 1
+      `,
+      [caregiverId],
+    );
+    if (existing.rows.length > 0) {
+      return String(existing.rows[0].id);
+    }
+
+    const inserted = await pool.query(
+      `
+        INSERT INTO agent_desk_threads (caregiver_id)
+        VALUES ($1)
+        ON CONFLICT (caregiver_id)
+        DO UPDATE SET caregiver_id = EXCLUDED.caregiver_id
+        RETURNING id::text
+      `,
+      [caregiverId],
+    );
+    return String(inserted.rows[0].id);
+  } catch (error) {
+    if (isUndefinedTableError(error)) {
+      markAgentDeskSchemaUnavailable('ensureAgentDeskThread');
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function appendAgentDeskDelegationUpdateMessage(input: {
+  pool: Pool;
+  caregiverId: string;
+  appointmentId: string;
+  content: string;
+  source: 'DELEGATION_PROGRESS' | 'DELEGATION_COMPLETION';
+  dedupeKey: string;
+  metadata: Record<string, unknown>;
+}): Promise<string | null> {
+  if (agentDeskSchemaUnavailable) return null;
+  const threadId = await ensureAgentDeskThread(input.pool, input.caregiverId);
+  if (!threadId) return null;
+
+  const runInsert = async (appointmentIdValue: string | null) => {
+    return input.pool.query(
+      `
+        INSERT INTO agent_desk_messages (
+          thread_id,
+          appointment_id,
+          actor_type,
+          content,
+          source,
+          metadata,
+          dedupe_key
+        )
+        VALUES ($1::uuid, $2::uuid, 'ASSISTANT', $3, $4, $5::jsonb, $6)
+        ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+        RETURNING id::text
+      `,
+      [threadId, appointmentIdValue, input.content, input.source, JSON.stringify(input.metadata), input.dedupeKey],
+    );
+  };
+
+  try {
+    const result = await (async () => {
+      try {
+        return await runInsert(input.appointmentId);
+      } catch (error) {
+        if (!isAgentDeskAppointmentForeignKeyError(error)) {
+          throw error;
+        }
+        console.warn('[AI] Ignoring stale appointment id for agent desk delegation update', {
+          caregiverId: input.caregiverId,
+          appointmentId: input.appointmentId,
+          source: input.source,
+        });
+        return runInsert(null);
+      }
+    })();
+    if (result.rows.length > 0) {
+      return String(result.rows[0].id);
+    }
+    const existing = await input.pool.query(
+      `
+        SELECT id::text
+        FROM agent_desk_messages
+        WHERE dedupe_key = $1
+        LIMIT 1
+      `,
+      [input.dedupeKey],
+    );
+    return existing.rows[0]?.id ? String(existing.rows[0].id) : null;
+  } catch (error) {
+    if (isUndefinedTableError(error)) {
+      markAgentDeskSchemaUnavailable('appendAgentDeskDelegationUpdateMessage');
+      return null;
+    }
+    throw error;
+  }
+}
+
 // --- CONSUMER LOOP ---
 export async function initializeConsumers(sqs: SQSClient, pool: Pool) {
   console.log('[AI] 🧠 Super-Worker Initialized (Analyst + Agent)...', {
     readinessPolicy: READINESS_POLICY,
+    consumerReliability: CONSUMER_RELIABILITY,
+    delegationCompletionNotifyV1: DELEGATION_COMPLETION_NOTIFY_V1,
+    delegationProgressNotifyV1: DELEGATION_PROGRESS_NOTIFY_V1,
   });
   const [chatQueueUrl, updatesQueueUrl] = await Promise.all([
     getQueueUrl(sqs, QUEUES.INCOMING_MESSAGES),
@@ -492,58 +818,166 @@ async function getQueueUrl(sqs: SQSClient, queueName: string): Promise<string> {
 async function pollChatQueue(sqs: SQSClient, pool: Pool, chatQueueUrl: string, updatesQueueUrl: string) {
   while (true) {
     try {
+      cleanupProcessedMessageCache(
+        CONSUMER_RELIABILITY.idempotencyTtlMs,
+        CONSUMER_RELIABILITY.idempotencyMaxKeys,
+      );
       const { Messages } = await sqs.send(new ReceiveMessageCommand({
-        QueueUrl: chatQueueUrl, MaxNumberOfMessages: 1, WaitTimeSeconds: 5
+        QueueUrl: chatQueueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: CONSUMER_RELIABILITY.waitTimeSeconds,
+        MessageSystemAttributeNames: ['ApproximateReceiveCount'],
       }));
 
       if (Messages && Messages.length > 0) {
         for (const msg of Messages) {
-          // Pass the pool to the processor
-          await processChatMessage(sqs, pool, msg, updatesQueueUrl);
-          
-          await sqs.send(new DeleteMessageCommand({
-            QueueUrl: chatQueueUrl, ReceiptHandle: msg.ReceiptHandle
-          }));
+          if (!msg.MessageId || !msg.ReceiptHandle) {
+            console.warn('[AI] Skipping malformed SQS message without MessageId/ReceiptHandle');
+            continue;
+          }
+
+          const receiveCount = parseReceiveCount(msg);
+          const idempotencyKey = buildIdempotencyKey(QUEUES.INCOMING_MESSAGES, msg);
+          if (hasProcessedRecently(idempotencyKey, CONSUMER_RELIABILITY.idempotencyTtlMs)) {
+            await sqs.send(
+              new DeleteMessageCommand({
+                QueueUrl: chatQueueUrl,
+                ReceiptHandle: msg.ReceiptHandle,
+              }),
+            );
+            console.log('[AI] Duplicate message acknowledged via idempotency cache', {
+              messageId: msg.MessageId,
+              receiveCount,
+            });
+            continue;
+          }
+          const persistentKey = buildPersistentIdempotencyKey(
+            INCOMING_MESSAGES_CONSUMER,
+            QUEUES.INCOMING_MESSAGES,
+            msg,
+          );
+          if (!persistentKey) {
+            await sqs.send(
+              new DeleteMessageCommand({
+                QueueUrl: chatQueueUrl,
+                ReceiptHandle: msg.ReceiptHandle,
+              }),
+            );
+            rememberProcessed(idempotencyKey);
+            console.warn('[AI] Dropped incoming message with missing MessageId for persistent idempotency', {
+              receiveCount,
+            });
+            continue;
+          }
+          if (await hasPersistentProcessedMessage(pool, persistentKey)) {
+            await sqs.send(
+              new DeleteMessageCommand({
+                QueueUrl: chatQueueUrl,
+                ReceiptHandle: msg.ReceiptHandle,
+              }),
+            );
+            rememberProcessed(idempotencyKey);
+            console.log('[AI] Duplicate message acknowledged via persistent idempotency store', {
+              messageId: msg.MessageId,
+              receiveCount,
+            });
+            continue;
+          }
+
+          try {
+            await processChatMessage(sqs, pool, msg, updatesQueueUrl);
+            await sqs.send(
+              new DeleteMessageCommand({
+                QueueUrl: chatQueueUrl,
+                ReceiptHandle: msg.ReceiptHandle,
+              }),
+            );
+            rememberProcessed(idempotencyKey);
+            await markPersistentProcessedMessage(pool, persistentKey, 'SUCCEEDED', {
+              messageId: msg.MessageId,
+            });
+          } catch (error) {
+            const nonRetryable = isNonRetryableHandlerError(error);
+            console.error('[AI] Message processing failed', {
+              messageId: msg.MessageId,
+              receiveCount,
+              retryClass: nonRetryable ? 'NON_RETRYABLE' : 'RETRYABLE',
+              error: error instanceof Error ? error.message : String(error),
+            });
+
+            if (nonRetryable) {
+              await sqs.send(
+                new DeleteMessageCommand({
+                  QueueUrl: chatQueueUrl,
+                  ReceiptHandle: msg.ReceiptHandle,
+                }),
+              );
+              rememberProcessed(idempotencyKey);
+              await markPersistentProcessedMessage(pool, persistentKey, 'DROPPED_NON_RETRYABLE', {
+                messageId: msg.MessageId,
+                errorCode: error instanceof NonRetryableMessageError ? error.code : 'NON_RETRYABLE',
+                errorMessage: error instanceof Error ? error.message : String(error),
+              });
+              console.warn('[AI] Dropped non-retryable incoming message (acked to prevent poison-loop)', {
+                messageId: msg.MessageId,
+              });
+            }
+          }
         }
       }
     } catch (error) {
       console.error('[AI] Polling Error:', error);
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      await new Promise(resolve => setTimeout(resolve, CONSUMER_RELIABILITY.pollErrorBackoffMs));
     }
   }
 }
 
 // --- MAIN PROCESSOR ---
 async function processChatMessage(sqs: SQSClient, pool: Pool, msg: Message, updatesQueueUrl: string) {
-  if (!msg.Body) return;
-
+  if (!msg.Body) {
+    throw new NonRetryableMessageError('Missing message body', 'MISSING_BODY');
+  }
+  let body: any;
   try {
-    const body = JSON.parse(msg.Body);
-    const text = body.text || '';
-    const appointmentId = body.appointmentId;
-    const senderType = body.senderType;
-    const messageId = body.messageId ? String(body.messageId) : undefined;
+    body = JSON.parse(msg.Body);
+  } catch {
+    throw new NonRetryableMessageError('Invalid JSON in incoming message event', 'INVALID_JSON');
+  }
 
-    // IGNORE: Messages sent by the System or the AI itself (Prevent Loops)
-    if (senderType === 'SYSTEM' || senderType === 'AI_AGENT') return;
+  const text = String(body.text || '').trim();
+  const appointmentId = String(body.appointmentId || '').trim();
+  const senderType = String(body.senderType || '').trim().toUpperCase();
+  const messageId = body.messageId ? String(body.messageId) : undefined;
 
-    console.log(`\n[AI] 📨 Processing: "${text}" from ${senderType}`);
+  if (!appointmentId) {
+    throw new NonRetryableMessageError('Incoming message missing appointmentId', 'MISSING_APPOINTMENT_ID');
+  }
+  if (!senderType) {
+    throw new NonRetryableMessageError('Incoming message missing senderType', 'MISSING_SENDER_TYPE');
+  }
+  if (!text) {
+    throw new NonRetryableMessageError('Incoming message missing text', 'MISSING_TEXT');
+  }
 
-    // --- JOB 1: THE READINESS ANALYST ---
-    // Run analysis for all human participants so client-side updates can mark checks PASS/FAIL too.
-    let readinessUpdates: ReadinessUpdate[] = [];
-    if (senderType === 'CAREGIVER' || senderType === 'FAMILY' || senderType === 'COORDINATOR') {
-      readinessUpdates = await runReadinessAnalysis(sqs, pool, text, appointmentId, senderType, updatesQueueUrl, messageId);
-    }
+  // IGNORE: Messages sent by the System or the AI itself (Prevent Loops)
+  if (senderType === 'SYSTEM' || senderType === 'AI_AGENT') return;
+  if (!['CAREGIVER', 'FAMILY', 'COORDINATOR'].includes(senderType)) {
+    throw new NonRetryableMessageError(`Unsupported senderType: ${senderType}`, 'INVALID_SENDER_TYPE');
+  }
 
-    // --- JOB 2: Delegated conversation mode ---
-    // Caregiver delegation controls whether AI can respond to non-caregiver participants.
-    if (senderType === 'FAMILY' || senderType === 'COORDINATOR') {
-      await runCaregiverAgent(pool, text, appointmentId, readinessUpdates);
-    }
+  console.log(`\n[AI] 📨 Processing: "${text}" from ${senderType}`);
 
-  } catch (error) {
-    console.error('[AI] Logic Error:', error);
+  // --- JOB 1: THE READINESS ANALYST ---
+  // Run analysis for all human participants so client-side updates can mark checks PASS/FAIL too.
+  let readinessUpdates: ReadinessUpdate[] = [];
+  if (senderType === 'CAREGIVER' || senderType === 'FAMILY' || senderType === 'COORDINATOR') {
+    readinessUpdates = await runReadinessAnalysis(sqs, pool, text, appointmentId, senderType, updatesQueueUrl, messageId);
+  }
+
+  // --- JOB 2: Delegated conversation mode ---
+  // Caregiver delegation controls whether AI can respond to non-caregiver participants.
+  if (senderType === 'FAMILY' || senderType === 'COORDINATOR') {
+    await runCaregiverAgent(pool, text, appointmentId, readinessUpdates, messageId);
   }
 }
 
@@ -562,26 +996,25 @@ async function classifyReadinessUpdates(
     messages: [
       {
         role: 'system',
-        content: `You are an intelligent Healthcare Logistics Assistant. Output valid JSON only.
-        
-Evaluate the message for these categories only:
-1. ACCESS_CONFIRMED
-2. MEDS_SUPPLIES_READY
-3. CARE_PLAN_CURRENT
-4. CAREGIVER_MATCH_CONFIRMED
+        content: `Output valid JSON only.
 
-For each category you have sufficient evidence for, return:
+Evaluate the latest message for these categories only:
+- ACCESS_CONFIRMED
+- MEDS_SUPPLIES_READY
+- CARE_PLAN_CURRENT
+- CAREGIVER_MATCH_CONFIRMED
+
+For each category with sufficient evidence, return:
 - category
 - status: PASS or FAIL
-- confidence: number from 0 to 1
-- reasoning: one sentence
+- confidence: 0 to 1
+- reasoning: one concise sentence
 
-If there is not enough evidence, omit that category.
-If unrelated, return {"updates":[]}.
-Interpretation rule for CARE_PLAN_CURRENT:
-- If the user says there are no changes/no updates and nothing indicates missing or outdated instructions, classify CARE_PLAN_CURRENT as PASS.
+Classify from semantics and conversation context, not keyword matching.
+If evidence is insufficient for a category, omit it.
+If message is unrelated, return {"updates":[]}.
 
-Return exactly:
+Return shape:
 {
   "updates": [
     {
@@ -653,14 +1086,28 @@ async function runCaregiverAgent(
   userText: string,
   appointmentId: string,
   readinessUpdates: ReadinessUpdate[],
+  messageId?: string,
 ) {
   console.log(`[AI] 🤖 Checking if Caregiver Agent should reply...`);
 
   // 1. Find who the caregiver is and load agent settings
-  const apptResult = await pool.query(`SELECT caregiver_id, service_type FROM appointments WHERE id = $1::uuid`, [appointmentId]);
+  const apptResult = await pool.query(
+    `
+      SELECT
+        a.caregiver_id,
+        a.service_type,
+        COALESCE(c.name, 'client') AS client_name
+      FROM appointments a
+      LEFT JOIN clients c ON c.id = a.client_id
+      WHERE a.id = $1::uuid
+      LIMIT 1
+    `,
+    [appointmentId],
+  );
   if (apptResult.rows.length === 0) return;
   const caregiverId = String(apptResult.rows[0].caregiver_id);
   const serviceType = apptResult.rows[0].service_type ? String(apptResult.rows[0].service_type) : null;
+  const clientName = String(apptResult.rows[0].client_name || 'client');
 
   // 2. Traffic cop check for global status and delegation window
   const agentResult = await pool.query(
@@ -671,6 +1118,7 @@ async function runCaregiverAgent(
   const settings = (agentResult.rows[0]?.persona_settings || {}) as any;
 
   const delegation = settings?.delegations?.[appointmentId];
+  const delegationIsSystemManaged = isSystemManagedDelegationEntry(delegation);
   const now = new Date();
   const endsAt = delegation?.endsAt ? new Date(delegation.endsAt) : null;
   let delegationActive = Boolean(delegation?.active);
@@ -720,62 +1168,140 @@ async function runCaregiverAgent(
   }
 
   const objective = String(delegation?.objective || 'Maintain communication and gather logistics updates.');
-  const rawQuestions: unknown[] = Array.isArray(delegation?.questions) ? delegation.questions : [];
-  const questions = rawQuestions.map(String);
-  const rawAsked: unknown[] = Array.isArray(delegation?.askedQuestionIndexes) ? delegation.askedQuestionIndexes : [];
-  const askedQuestionIndexes: number[] = rawAsked
-    .map((value) => Number(value))
-    .filter((value) => Number.isInteger(value) && value >= 0);
+  const normalizedDelegation = normalizeDelegationQuestions(delegation || {});
+  const questions = normalizedDelegation.questions;
+  const primaryQuestionIndexes = normalizedDelegation.primaryIndexes;
+  const optionalQuestionIndexes = normalizedDelegation.optionalIndexes;
+  const delegationTypeRaw = String(
+    delegation?.delegationType || delegation?.contextPacket?.delegationType || '',
+  )
+    .trim()
+    .toUpperCase();
+  const delegationType: 'FACT_CHECK' | 'LOGISTICS' | 'OPEN_ENDED' =
+    delegationTypeRaw === 'FACT_CHECK' || delegationTypeRaw === 'LOGISTICS' || delegationTypeRaw === 'OPEN_ENDED'
+      ? delegationTypeRaw
+      : 'OPEN_ENDED';
+  const askedQuestionIndexes = normalizeDelegationIndexList(delegation?.askedQuestionIndexes, questions.length);
   const alreadyAsked = new Set(askedQuestionIndexes);
 
-  // Mark delegated questions as answered from this incoming client message.
-  const answeredByClient = new Set<number>();
-  questions.forEach((q, idx) => {
-    if (questionLikelyAnswered(q, userText)) {
-      answeredByClient.add(idx);
-    }
+  const conversationContext = await buildConversationContext(pool, appointmentId, messageId);
+  const delegatedAssessments = await assessDelegationQuestionsWithLLM({
+    questions,
+    latestMessage: userText,
+    conversationContext,
   });
 
-  const unaskedIndexes = questions
-    .map((q, idx) => ({ q, idx }))
-    .filter(({ q, idx }) => !alreadyAsked.has(idx) && !answeredByClient.has(idx) && !looksLikeNonClientOwnedQuestion(q))
-    .map(({ idx }) => idx);
-  const delegatedNextQuestion = delegationActive && unaskedIndexes.length > 0 ? questions[unaskedIndexes[0]] : null;
+  const ANSWERED_CONFIDENCE_THRESHOLD = 0.6;
+  const ASKABLE_CONFIDENCE_THRESHOLD = 0.45;
+
+  const askableQuestions = new Set<number>();
+  if (delegatedAssessments && delegatedAssessments.length > 0) {
+    for (const assessment of delegatedAssessments) {
+      if (assessment.askable && assessment.confidence >= ASKABLE_CONFIDENCE_THRESHOLD) {
+        askableQuestions.add(assessment.index);
+      }
+    }
+  } else {
+    for (let i = 0; i < questions.length; i += 1) {
+      askableQuestions.add(i);
+    }
+  }
+
+  const answeredByClient = new Set<number>();
+  if (delegatedAssessments && delegatedAssessments.length > 0) {
+    for (const assessment of delegatedAssessments) {
+      if (assessment.answered && assessment.confidence >= ANSWERED_CONFIDENCE_THRESHOLD) {
+        answeredByClient.add(assessment.index);
+      }
+    }
+  }
+
+  const completionEvaluation = evaluateDelegationCompletion({
+    questions,
+    askableIndexes: Array.from(askableQuestions.values()),
+    requiredIndexes: primaryQuestionIndexes,
+    existingResolvedIndexes: delegation?.resolvedQuestionIndexes,
+    answeredIndexes: Array.from(answeredByClient.values()),
+    delegationActive,
+    delegationIsSystemManaged,
+    completionAlreadyNotified: Boolean(delegation?.completionNotifiedAt),
+    notifyFlagEnabled: DELEGATION_COMPLETION_NOTIFY_V1,
+  });
+  const resolvedIndexesSet = new Set<number>(completionEvaluation.resolvedIndexes);
+  const primarySet = new Set<number>(primaryQuestionIndexes);
+  const optionalSet = new Set<number>(optionalQuestionIndexes);
+  const baseUnasked = questions
+    .map((_, idx) => idx)
+    .filter((idx) => !alreadyAsked.has(idx) && !resolvedIndexesSet.has(idx) && askableQuestions.has(idx));
+  const unaskedPrimaryIndexes = baseUnasked.filter((idx) => primarySet.has(idx));
+  const unaskedOptionalIndexes = baseUnasked.filter((idx) => optionalSet.has(idx));
+  const unaskedIndexes =
+    delegationType === 'FACT_CHECK'
+      ? unaskedPrimaryIndexes
+      : [...unaskedPrimaryIndexes, ...unaskedOptionalIndexes, ...baseUnasked.filter((idx) => !primarySet.has(idx) && !optionalSet.has(idx))];
+  const unresolvedRequiredIndexListEarly = completionEvaluation.unresolvedRequiredIndexes;
+  const canAskFactCheckClarification =
+    delegationType === 'FACT_CHECK' &&
+    unresolvedRequiredIndexListEarly.length > 0 &&
+    !Boolean((delegation as any)?.factCheckClarificationAsked);
+  const clarificationQuestionIndex = canAskFactCheckClarification ? unresolvedRequiredIndexListEarly[0] : null;
+  const delegatedNextQuestionIndex = unaskedIndexes.length > 0
+    ? unaskedIndexes[0]
+    : clarificationQuestionIndex;
+  const delegatedNextQuestion =
+    delegationActive && delegatedNextQuestionIndex !== null ? questions[delegatedNextQuestionIndex] : null;
   const nextChecklist = getNextChecklistQuestion(planner);
-  const forcedQuestion = nextChecklist?.question || delegatedNextQuestion || null;
+  const forcedQuestion = pickForcedQuestion({
+    delegationActive,
+    delegationIsSystemManaged,
+    delegatedNextQuestion,
+    checklistNextQuestion: nextChecklist?.question || null,
+  });
 
   // 3. GENERATE REPLY (Using OpenAI)
   console.log(`[AI] ✅ Agent ACTIVE: Generating reply...`);
-  
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { 
-        role: "system", 
-        content: `You are the AI delegate for a professional caregiver.
-        Conversation mode: ${delegationActive ? 'DELEGATION' : 'SYSTEM_PRECHECK'}
-        Delegation objective: ${objective}
-        Delegation expires at: ${endsAt ? endsAt.toISOString() : 'N/A'}
-        Questions caregiver asked you to collect: ${questions.length > 0 ? questions.join(' | ') : 'None provided'}
-        Questions already asked in this delegation: ${askedQuestionIndexes.length > 0 ? askedQuestionIndexes.map((i) => questions[i]).join(' | ') : 'None'}
-        Checklist progress: ${checklistProgressSummary(planner)}
-        Required next question: ${forcedQuestion || 'None'}
-        Rules:
-        - Be brief and practical and keep the client informed.
-        - Only discuss logistics and appointment coordination.
-        - Reason about who is likely to know each detail before you ask.
-        - Avoid asking for details that are normally controlled by the care team rather than the client.
-        - Ask at most one question.
-        - If "Required next question" is provided, include it exactly once.
-        - Do not repeat questions that were already asked or already answered.
-        - Never give medical advice or emergency guidance.` 
-      },
-      { role: "user", content: userText },
-    ],
-    temperature: 0.5,
-  });
-
-  const replyText = completion.choices[0].message.content || 'Thanks for the update. I have noted it.';
+  const shouldUseDeterministicAck =
+    delegationActive &&
+    !delegationIsSystemManaged &&
+    delegationType === 'FACT_CHECK' &&
+    !forcedQuestion;
+  const replyText = shouldUseDeterministicAck
+    ? 'Thanks for the update. I have noted it and shared it with your caregiver.'
+    : (
+        (await openai.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            { 
+              role: "system", 
+              content: `You are the AI delegate for a professional caregiver.
+              Conversation mode: ${delegationActive ? 'DELEGATION' : 'SYSTEM_PRECHECK'}
+              Delegation type: ${delegationType}
+              Delegation objective: ${objective}
+              Delegation expires at: ${endsAt ? endsAt.toISOString() : 'N/A'}
+              Questions caregiver asked you to collect: ${questions.length > 0 ? questions.join(' | ') : 'None provided'}
+              Primary questions to resolve: ${primaryQuestionIndexes.length > 0 ? primaryQuestionIndexes.map((i) => questions[i]).join(' | ') : 'None'}
+              Optional questions: ${optionalQuestionIndexes.length > 0 ? optionalQuestionIndexes.map((i) => questions[i]).join(' | ') : 'None'}
+              Questions already asked in this delegation: ${askedQuestionIndexes.length > 0 ? askedQuestionIndexes.map((i) => questions[i]).join(' | ') : 'None'}
+              Checklist progress: ${checklistProgressSummary(planner)}
+              Required next question: ${forcedQuestion || 'None'}
+              Rules:
+              - Be brief and practical and keep the client informed.
+              - Keep replies to at most 2 short sentences and under 45 words.
+              - Only discuss logistics and appointment coordination.
+              - Reason about who is likely to know each detail before you ask.
+              - Avoid asking for details that are normally controlled by the care team rather than the client.
+              - Ask at most one question.
+              - If "Required next question" is provided, include it exactly once.
+              - If "Required next question" is None, do not ask a new question.
+              - Do not introduce exploratory questions beyond the listed primary/optional questions.
+              - Do not repeat questions that were already asked or already answered.
+              - Never give medical advice or emergency guidance.` 
+            },
+            { role: "user", content: userText },
+          ],
+          temperature: 0.2,
+        })).choices[0].message.content || 'Thanks for the update. I have noted it.'
+      );
 
   // 4. INSERT REPLY INTO DB
   await pool.query(`
@@ -784,19 +1310,175 @@ async function runCaregiverAgent(
   `, [appointmentId, caregiverId, replyText]);
 
   // Persist delegation question progress so we do not keep asking repeats.
-  if (delegatedNextQuestion && forcedQuestion === delegatedNextQuestion) {
+  const askedIndexThisTurn =
+    delegatedNextQuestion && forcedQuestion === delegatedNextQuestion
+      ? delegatedNextQuestionIndex
+      : null;
+  const askedClarificationThisTurn =
+    delegationType === 'FACT_CHECK' &&
+    askedIndexThisTurn !== null &&
+    alreadyAsked.has(askedIndexThisTurn);
+  const resolvedIndexList = completionEvaluation.resolvedIndexes;
+  const unresolvedIndexList = completionEvaluation.unresolvedIndexes;
+  const requiredResolvedIndexList = completionEvaluation.requiredResolvedIndexes;
+  const unresolvedRequiredIndexList = completionEvaluation.unresolvedRequiredIndexes;
+  const completionReady = completionEvaluation.shouldNotifyCompletion;
+  let completionNotifiedAt: string | undefined;
+  let progressMessageId: string | null = null;
+  let completionMessageId: string | null = null;
+  let progressNotifiedIndexesToPersist: number[] | undefined;
+
+  const previousProgressNotifiedIndexes = normalizeDelegationIndexList(
+    delegation?.progressNotifiedIndexes,
+    questions.length,
+  );
+  const previousProgressNotifiedSet = new Set<number>(previousProgressNotifiedIndexes);
+  const newlyResolvedPrimaryIndexes = requiredResolvedIndexList.filter((idx) => !previousProgressNotifiedSet.has(idx));
+  const shouldNotifyProgress =
+    DELEGATION_PROGRESS_NOTIFY_V1 &&
+    delegationActive &&
+    !delegationIsSystemManaged &&
+    !completionReady &&
+    newlyResolvedPrimaryIndexes.length > 0;
+
+  if (shouldNotifyProgress) {
+    const progressMessage = formatDelegationProgressUpdate({
+      clientName,
+      questions,
+      newlyResolvedIndexes: newlyResolvedPrimaryIndexes,
+      unresolvedRequiredIndexes: unresolvedRequiredIndexList,
+      latestClientMessage: userText,
+    });
+    const dedupeKey = buildDelegationProgressDedupeKey({
+      appointmentId,
+      startedAt: String(delegation?.startedAt || ''),
+      resolvedPrimaryIndexes: requiredResolvedIndexList,
+    });
+    try {
+      progressMessageId = await appendAgentDeskDelegationUpdateMessage({
+        pool,
+        caregiverId,
+        appointmentId,
+        content: progressMessage,
+        source: 'DELEGATION_PROGRESS',
+        dedupeKey,
+        metadata: {
+          appointmentId,
+          caregiverId,
+          clientName,
+          latestClientMessage: userText,
+          newlyResolvedPrimaryIndexes,
+          unresolvedRequiredIndexes: unresolvedRequiredIndexList,
+        },
+      });
+      if (progressMessageId) {
+        progressNotifiedIndexesToPersist = requiredResolvedIndexList;
+      }
+    } catch (error) {
+      console.error('[AI] Failed to write delegation progress update to agent desk', {
+        appointmentId,
+        caregiverId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (completionReady) {
+    const completionMessage = formatDelegationCompletionUpdate({
+      clientName,
+      questions,
+      resolvedIndexes: resolvedIndexList,
+      unresolvedRequiredIndexes: unresolvedRequiredIndexList,
+      latestClientMessage: userText,
+    });
+    const dedupeKey = buildDelegationCompletionDedupeKey({
+      appointmentId,
+      startedAt: String(delegation?.startedAt || ''),
+    });
+    try {
+      completionMessageId = await appendAgentDeskDelegationUpdateMessage({
+        pool,
+        caregiverId,
+        appointmentId,
+        content: completionMessage,
+        source: 'DELEGATION_COMPLETION',
+        dedupeKey,
+        metadata: {
+          appointmentId,
+          caregiverId,
+          clientName,
+          latestClientMessage: userText,
+          resolvedQuestionIndexes: resolvedIndexList,
+          unresolvedQuestionIndexes: unresolvedIndexList,
+          unresolvedRequiredQuestionIndexes: unresolvedRequiredIndexList,
+        },
+      });
+      if (completionMessageId) {
+        completionNotifiedAt = new Date().toISOString();
+        progressNotifiedIndexesToPersist = requiredResolvedIndexList;
+      }
+    } catch (error) {
+      console.error('[AI] Failed to write delegation completion update to agent desk', {
+        appointmentId,
+        caregiverId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const previousResolvedIndexes = normalizeDelegationIndexList(delegation?.resolvedQuestionIndexes, questions.length);
+  const resolvedChanged =
+    previousResolvedIndexes.length !== resolvedIndexList.length ||
+    previousResolvedIndexes.some((idx: number, offset: number) => idx !== resolvedIndexList[offset]);
+  const progressChanged =
+    Array.isArray(progressNotifiedIndexesToPersist) &&
+    (
+      progressNotifiedIndexesToPersist.length !== previousProgressNotifiedIndexes.length ||
+      progressNotifiedIndexesToPersist.some((idx, offset) => idx !== previousProgressNotifiedIndexes[offset])
+    );
+  const shouldPersistDelegationProgress =
+    delegationActive && (
+      askedIndexThisTurn !== null ||
+      resolvedChanged ||
+      progressChanged ||
+      Boolean(completionNotifiedAt)
+    );
+  if (shouldPersistDelegationProgress) {
     const updatedSettings = { ...settings };
     updatedSettings.delegations = { ...(updatedSettings.delegations || {}) };
-    const current = updatedSettings.delegations[appointmentId] || delegation;
+    const current = updatedSettings.delegations[appointmentId] || delegation || {};
     const currentAsked = Array.isArray(current.askedQuestionIndexes) ? current.askedQuestionIndexes : [];
-    if (!currentAsked.includes(unaskedIndexes[0])) {
-      current.askedQuestionIndexes = [...currentAsked, unaskedIndexes[0]];
-    }
-    updatedSettings.delegations[appointmentId] = current;
+    const nextAsked = askedIndexThisTurn !== null && !currentAsked.includes(askedIndexThisTurn)
+      ? [...currentAsked, askedIndexThisTurn].sort((a: number, b: number) => a - b)
+      : currentAsked;
+    updatedSettings.delegations[appointmentId] = {
+      ...current,
+      askedQuestionIndexes: nextAsked,
+      resolvedQuestionIndexes: resolvedIndexList,
+      progressNotifiedIndexes: progressNotifiedIndexesToPersist || current.progressNotifiedIndexes,
+      factCheckClarificationAsked: Boolean(current.factCheckClarificationAsked) || askedClarificationThisTurn,
+      completionNotifiedAt: completionNotifiedAt || current.completionNotifiedAt,
+    };
     await pool.query(
       `UPDATE user_agents SET persona_settings = $2::jsonb WHERE user_id = $1`,
       [caregiverId, JSON.stringify(updatedSettings)]
     );
+  }
+
+  if (progressMessageId) {
+    console.log('[AI] Delegation progress update written to agent desk', {
+      appointmentId,
+      caregiverId,
+      progressMessageId,
+    });
+  }
+
+  if (completionMessageId) {
+    console.log('[AI] Delegation completion update written to agent desk', {
+      appointmentId,
+      caregiverId,
+      completionMessageId,
+    });
   }
 
   if (nextChecklist && forcedQuestion === nextChecklist.question) {
@@ -808,47 +1490,69 @@ async function runCaregiverAgent(
     const failedChecks = CHECKLIST_ORDER.filter((checkType) => planner.items[checkType].status === 'FAIL');
     const resolved = failedChecks.length === 0;
     const nowIso = new Date().toISOString();
+    const latestAgentRes = await pool.query(
+      `
+        SELECT persona_settings
+        FROM user_agents
+        WHERE user_id = $1
+        LIMIT 1
+      `,
+      [caregiverId],
+    );
+    const latestSettings = (latestAgentRes.rows[0]?.persona_settings || settings || {}) as any;
+    const latestDelegations = { ...(latestSettings.delegations || {}) };
+    const delegationEntry = (latestDelegations[appointmentId] || {}) as any;
+    const canWritePrecheckSummaryToDelegation = shouldWritePrecheckSummaryToDelegation(
+      Object.keys(delegationEntry).length > 0 ? delegationEntry : null,
+    );
+    const delegationObjective = String(
+      delegationEntry.objective || 'Complete pre-readiness checklist and escalate unresolved blockers.',
+    );
+    const delegationQuestions = Array.isArray(delegationEntry.questions)
+      ? delegationEntry.questions.map(String)
+      : CHECKLIST_ORDER.map((k) => planner.items[k].question);
+    const precheckSummary = buildPrecheckCompletionSummary(planner);
 
-    const delegationEntry = (settings?.delegations?.[appointmentId] || {}) as any;
-    const delegationObjective = String(delegationEntry.objective || 'Complete pre-readiness checklist and escalate unresolved blockers.');
-    const delegationQuestions = Array.isArray(delegationEntry.questions) ? delegationEntry.questions.map(String) : CHECKLIST_ORDER.map((k) => planner.items[k].question);
-    const precheckSummary = resolved
-      ? `Pre-readiness checklist completed. All critical checks were resolved. ${checklistProgressSummary(planner)}.`
-      : `Pre-readiness checklist completed with unresolved blockers requiring caregiver follow-up: ${failedChecks.join(', ')}. ${checklistProgressSummary(planner)}.`;
-
-    const updatedSettings = { ...(settings || {}) };
-    updatedSettings.delegations = { ...(updatedSettings.delegations || {}) };
-    updatedSettings.delegations[appointmentId] = {
-      ...delegationEntry,
-      appointmentId,
-      active: false,
-      objective: delegationObjective,
-      questions: delegationQuestions,
-      startedAt: delegationEntry.startedAt || nowIso,
-      endsAt: delegationEntry.endsAt || nowIso,
-      endedAt: nowIso,
-      summary: precheckSummary,
-      summaryGeneratedAt: nowIso,
-      escalationRequired: !resolved,
-      source: delegationEntry.source || 'PRECHECK_AUTOMATION',
-      systemManaged: true,
-    };
-    updatedSettings.summaryHistory = [
-      ...(Array.isArray(updatedSettings.summaryHistory) ? updatedSettings.summaryHistory : []),
-      {
+    if (canWritePrecheckSummaryToDelegation) {
+      const updatedSettings = { ...latestSettings };
+      updatedSettings.delegations = { ...latestDelegations };
+      updatedSettings.delegations[appointmentId] = {
+        ...delegationEntry,
         appointmentId,
+        active: false,
         objective: delegationObjective,
         questions: delegationQuestions,
         startedAt: delegationEntry.startedAt || nowIso,
+        endsAt: delegationEntry.endsAt || nowIso,
         endedAt: nowIso,
         summary: precheckSummary,
         summaryGeneratedAt: nowIso,
-      },
-    ];
-    await pool.query(
-      `UPDATE user_agents SET persona_settings = $2::jsonb WHERE user_id = $1`,
-      [caregiverId, JSON.stringify(updatedSettings)],
-    );
+        escalationRequired: !resolved,
+        source: delegationEntry.source || 'PRECHECK_AUTOMATION',
+        systemManaged: true,
+      };
+      updatedSettings.summaryHistory = [
+        ...(Array.isArray(updatedSettings.summaryHistory) ? updatedSettings.summaryHistory : []),
+        {
+          appointmentId,
+          objective: delegationObjective,
+          questions: delegationQuestions,
+          startedAt: delegationEntry.startedAt || nowIso,
+          endedAt: nowIso,
+          summary: precheckSummary,
+          summaryGeneratedAt: nowIso,
+        },
+      ];
+      await pool.query(
+        `UPDATE user_agents SET persona_settings = $2::jsonb WHERE user_id = $1`,
+        [caregiverId, JSON.stringify(updatedSettings)],
+      );
+    } else {
+      console.log('[AI] Skipping precheck delegation-summary write for caregiver-managed delegation', {
+        appointmentId,
+        caregiverId,
+      });
+    }
 
     if (!resolved) {
       await pool.query(

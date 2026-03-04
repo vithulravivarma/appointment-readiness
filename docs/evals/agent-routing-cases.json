@@ -1,0 +1,96 @@
+{
+  "version": "2026-03-03",
+  "description": "Routing eval seeds for caregiver command intent and missing-info acquisition behavior.",
+  "cases": [
+    {
+      "id": "delegation_named_person_find_out",
+      "command": "does yashwanth have advil? if you don't know, can you find out for me",
+      "expected": {
+        "policy_action": "ACQUIRE_MISSING_INFO",
+        "tool": "START_DELEGATION",
+        "requires_confirmation": true
+      }
+    },
+    {
+      "id": "delegation_named_person_reach_out",
+      "command": "please reach out to yashwanth and ask about access code",
+      "expected": {
+        "policy_action": "ACQUIRE_MISSING_INFO",
+        "tool": "START_DELEGATION",
+        "requires_confirmation": true
+      }
+    },
+    {
+      "id": "delegation_pronoun_find_out",
+      "command": "if we don't know whether they have meds, can you find out",
+      "expected": {
+        "policy_action": "ACQUIRE_MISSING_INFO",
+        "tool": "START_DELEGATION",
+        "requires_confirmation": true
+      }
+    },
+    {
+      "id": "client_info_history_lookup",
+      "command": "what did the family say last time about access code",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "CLIENT_INFO",
+        "requires_confirmation": false
+      }
+    },
+    {
+      "id": "schedule_question",
+      "command": "what's my schedule tomorrow",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "SCHEDULE_DAY",
+        "requires_confirmation": false
+      }
+    },
+    {
+      "id": "maps_question",
+      "command": "how long from home to my first visit tomorrow",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "MAPS_ROUTE",
+        "requires_confirmation": false
+      }
+    },
+    {
+      "id": "accidental_no_contact",
+      "command": "does he have ibuprofen? never mind don't contact them",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "RESPOND_OR_CLIENT_INFO",
+        "requires_confirmation": false
+      }
+    },
+    {
+      "id": "generic_chitchat",
+      "command": "thanks that's all",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "RESPOND",
+        "requires_confirmation": false
+      }
+    },
+    {
+      "id": "multi_missing_facts",
+      "command": "is there food in his fridge and does he have a dog at home? if unknown can you find out",
+      "expected": {
+        "policy_action": "ACQUIRE_MISSING_INFO",
+        "tool": "START_DELEGATION",
+        "requires_confirmation": true
+      }
+    },
+    {
+      "id": "explicit_cancel_pending",
+      "command": "cancel that",
+      "expected": {
+        "policy_action": "ANSWER_FROM_KNOWN_INFO",
+        "tool": "CANCEL_PENDING",
+        "requires_confirmation": false
+      }
+    }
+  ]
+}

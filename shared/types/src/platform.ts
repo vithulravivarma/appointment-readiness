@@ -2,6 +2,7 @@ export const QUEUES = {
   INCOMING_MESSAGES: 'incoming-messages-queue',
   READINESS_UPDATES: 'readiness-updates-queue',
   READINESS_EVALUATION: 'readiness-evaluation-queue',
+  INGESTION: 'ingestion-queue',
   NOTIFICATION: 'notification-queue',
   BRIEF_GENERATION: 'brief-generation-queue',
   TIMESHEETS: 'timesheets-queue',

@@ -12,6 +12,7 @@ The repository is a local-first monorepo for appointment readiness operations wi
 - Readiness checks are stored in `readiness_checks`.
 - Chat history is stored in `messages`.
 - Digital twin state is stored in `user_agents`.
+- Agent Desk caregiver command chat is stored in `agent_desk_threads` + `agent_desk_messages`.
 
 There is no separate `appointment_readiness` table in the active schema.
 
@@ -78,6 +79,7 @@ Use these names as the current standard:
 - Summaries are appended to `persona_settings.summaryHistory` so they persist across future delegations.
 - System-only delegation notes are hidden from client/family chat views.
 - `Agent Desk` shows active delegations and recent summaries across appointments.
+- Agent Desk free-form caregiver/assistant chat persists across sessions via `GET /agents/:userId/chat/history`.
 
 ## Ingestion Workflow (Current + Future)
 - `ingestion-service` now supports a source abstraction (`IngestionSource`) so ingestion transport can change without rewriting mapping logic.

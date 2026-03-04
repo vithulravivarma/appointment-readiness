@@ -7,19 +7,31 @@ import { DS, baseStyles } from '../../design/system';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 export default function ChatScreen() {
-  const { id, role, userId, authToken } = useLocalSearchParams();
+  const { id, role, userId, authToken, clientName, appointmentStartTime, contextSource } = useLocalSearchParams();
   const currentRole = role || 'CAREGIVER';
   const currentUserId = userId || 'demo-user';
   const router = useRouter();
 
   const [message, setMessage] = useState('');
   const [history, setHistory] = useState([]);
+  const [context, setContext] = useState({
+    clientName: String(clientName || ''),
+    appointmentStartTime: String(appointmentStartTime || ''),
+    source: String(contextSource || 'selected_appointment'),
+  });
   const flatListRef = useRef(null);
 
   useEffect(() => {
     fetchHistory();
     const interval = setInterval(fetchHistory, 3000);
     return () => clearInterval(interval);
+  }, [id]);
+
+  useEffect(() => {
+    if (context.clientName && context.appointmentStartTime) {
+      return;
+    }
+    resolveAppointmentContext();
   }, [id]);
 
   const fetchHistory = async () => {
@@ -66,6 +78,25 @@ export default function ChatScreen() {
 
   const isMe = (msgSenderType) => msgSenderType === currentRole;
 
+  const resolveAppointmentContext = async () => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/appointments`, {
+        params: { userId: currentUserId, role: currentRole },
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+      });
+      const list = Array.isArray(res.data) ? res.data : [];
+      const match = list.find((item) => String(item.id) === String(id));
+      if (!match) return;
+      setContext({
+        clientName: String(match.client_name || ''),
+        appointmentStartTime: String(match.start_time || ''),
+        source: 'resolved_from_appointments',
+      });
+    } catch (e) {
+      console.error('Failed to resolve chat context', e);
+    }
+  };
+
   return (
     <SafeAreaView style={styles.safeArea} edges={['left', 'right', 'bottom']}>
       <KeyboardAvoidingView
@@ -74,6 +105,27 @@ export default function ChatScreen() {
         style={styles.container}
       >
         <Stack.Screen options={{ title: `Chat (${currentRole})` }} />
+
+        <View style={styles.contextBar}>
+          <View style={styles.contextTextWrap}>
+            <Text style={styles.contextTitle}>
+              Context: {context.clientName || 'Unknown client'}
+              {context.appointmentStartTime ? ` • ${formatApptDateTime(context.appointmentStartTime)}` : ''}
+            </Text>
+            <Text style={styles.contextMeta}>Source: {context.source === 'selected_appointment' ? 'Selected visit' : 'Resolved from schedule'}</Text>
+          </View>
+          <TouchableOpacity
+            style={styles.switchBtn}
+            onPress={() =>
+              router.push({
+                pathname: '/appointment-list',
+                params: { role: currentRole, userId: currentUserId, authToken },
+              })
+            }
+          >
+            <Text style={styles.switchBtnText}>Switch</Text>
+          </TouchableOpacity>
+        </View>
 
         {currentRole === 'CAREGIVER' && (
           <View style={styles.agentBar}>
@@ -150,12 +202,57 @@ export default function ChatScreen() {
   );
 }
 
+function formatApptDateTime(value) {
+  const date = new Date(value || '');
+  if (Number.isNaN(date.getTime())) {
+    return 'Date unavailable';
+  }
+  return `${date.toLocaleDateString()} • ${date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+}
+
 const styles = StyleSheet.create({
   safeArea: {
     ...baseStyles.screen,
   },
   container: {
     ...baseStyles.screen,
+  },
+  contextBar: {
+    backgroundColor: DS.colors.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: DS.colors.border,
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  contextTextWrap: {
+    flex: 1,
+    paddingRight: DS.spacing.sm,
+  },
+  contextTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  contextMeta: {
+    marginTop: DS.spacing.xxs,
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+  },
+  switchBtn: {
+    backgroundColor: DS.colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: DS.spacing.xs,
+  },
+  switchBtnText: {
+    color: DS.colors.textSecondary,
+    fontWeight: '700',
+    fontSize: DS.typography.caption,
   },
   agentBar: {
     backgroundColor: DS.colors.surface,
