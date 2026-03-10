@@ -32,20 +32,35 @@ export interface ReadinessEvaluationEvent {
 // 2. Readiness Engine -> Notification Service
 // Queue: notification-queue
 export interface NotificationJob {
-  type: 'SMS' | 'EMAIL' | 'PUSH';
+  type: 'SMS' | 'EMAIL' | 'PUSH' | 'WHATSAPP';
   recipient: string;
   templateId: string;
   data: Record<string, string>; // Variables for the template
   correlationId?: string;
+  provider?: 'TWILIO_WHATSAPP';
+  fromEndpoint?: string;
+  toEndpoint?: string;
+  conversationRef?: string;
+  externalMessageId?: string;
 }
 
 // 3. Appointment API -> AI Interpreter
 // Queue: incoming-messages-queue
 export interface InboundMessageEvent {
-  rawContent: string;
-  sender: string;
-  receivedAt: string;
-  messageId: string;
+  type?: 'NEW_MESSAGE';
+  appointmentId?: string;
+  text?: string;
+  senderType?: 'FAMILY' | 'CAREGIVER' | 'COORDINATOR' | 'SYSTEM' | 'AI_AGENT';
+  senderId?: string;
+  messageId?: string;
+  channel?: 'APP' | 'WHATSAPP';
+  provider?: 'TWILIO_WHATSAPP';
+  fromEndpoint?: string;
+  toEndpoint?: string;
+  externalMessageId?: string;
+  rawContent?: string;
+  sender?: string;
+  receivedAt?: string;
 }
 
 // 4. AI Interpreter -> Readiness Engine

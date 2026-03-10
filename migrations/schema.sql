@@ -182,3 +182,39 @@ CREATE INDEX IF NOT EXISTS idx_agent_desk_messages_appointment_created_desc
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_desk_messages_dedupe_key
     ON agent_desk_messages(dedupe_key)
     WHERE dedupe_key IS NOT NULL;
+
+-- 14. CHANNEL ENDPOINTS (Demo mapping for external transport endpoints)
+CREATE TABLE IF NOT EXISTS channel_endpoints (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(80) NOT NULL,
+    endpoint VARCHAR(120) NOT NULL,
+    entity_type VARCHAR(40) NOT NULL CHECK (entity_type IN ('CLIENT', 'CAREGIVER', 'COORDINATOR')),
+    entity_id UUID NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    verified BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_seen_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(provider, endpoint, entity_type, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_endpoints_provider_endpoint
+    ON channel_endpoints(provider, endpoint);
+
+-- 15. WEBHOOK INBOX EVENTS (Inbound idempotency + status tracking)
+CREATE TABLE IF NOT EXISTS webhook_inbox_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(80) NOT NULL,
+    provider_message_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(80) NOT NULL DEFAULT 'INBOUND',
+    status VARCHAR(80) NOT NULL DEFAULT 'RECEIVED',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_inbox_events_provider_message
+    ON webhook_inbox_events(provider, provider_message_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_inbox_events_created_desc
+    ON webhook_inbox_events(created_at DESC);

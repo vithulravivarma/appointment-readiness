@@ -30,6 +30,16 @@ export interface Config {
     agentDeskPersistenceV1: boolean;
     delegationContextCompilerV1: boolean;
   };
+  whatsapp: {
+    enabled: boolean;
+    trialMode: boolean;
+    allowlistNumbers: string[];
+    twilioAccountSid: string;
+    twilioApiKeySid: string;
+    twilioApiKeySecret: string;
+    twilioAuthToken: string;
+    twilioWhatsAppFrom: string;
+  };
 }
 
 export function loadConfig(): Config {
@@ -61,6 +71,21 @@ export function loadConfig(): Config {
     delegationContextCompilerV1Raw === '1' ||
     delegationContextCompilerV1Raw === 'true' ||
     delegationContextCompilerV1Raw === 'yes';
+  const whatsappEnabledRaw = String(process.env.WHATSAPP_ENABLED || 'false').toLowerCase();
+  const whatsappTrialModeRaw = String(process.env.WHATSAPP_TRIAL_MODE || 'true').toLowerCase();
+  const whatsappAllowlistRaw = String(process.env.WHATSAPP_ALLOWLIST_NUMBERS || '').trim();
+  const whatsappEnabled = whatsappEnabledRaw === '1' || whatsappEnabledRaw === 'true' || whatsappEnabledRaw === 'yes';
+  const whatsappTrialMode =
+    whatsappTrialModeRaw === '1' || whatsappTrialModeRaw === 'true' || whatsappTrialModeRaw === 'yes';
+  const whatsappAllowlistNumbers = whatsappAllowlistRaw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const twilioAccountSid = String(process.env.TWILIO_ACCOUNT_SID || '').trim();
+  const twilioApiKeySid = String(process.env.TWILIO_API_KEY_SID || '').trim();
+  const twilioApiKeySecret = String(process.env.TWILIO_API_KEY_SECRET || '').trim();
+  const twilioAuthToken = String(process.env.TWILIO_AUTH_TOKEN || '').trim();
+  const twilioWhatsAppFrom = String(process.env.TWILIO_WHATSAPP_FROM || '').trim();
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
@@ -91,6 +116,16 @@ export function loadConfig(): Config {
       aiFirstIntentV1,
       agentDeskPersistenceV1,
       delegationContextCompilerV1,
+    },
+    whatsapp: {
+      enabled: whatsappEnabled,
+      trialMode: whatsappTrialMode,
+      allowlistNumbers: whatsappAllowlistNumbers,
+      twilioAccountSid,
+      twilioApiKeySid,
+      twilioApiKeySecret,
+      twilioAuthToken,
+      twilioWhatsAppFrom,
     },
   };
 }

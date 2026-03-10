@@ -51,6 +51,7 @@ type CheckDefinition = {
 };
 
 type CommandMode = 'DELEGATION_STARTED' | 'ANSWERED' | 'SUGGESTION' | 'FOLLOW_UP';
+type AgentDeskTab = 'CHAT' | 'OPERATIONS';
 
 type CommandHistoryItem = {
   id: string;
@@ -95,16 +96,13 @@ export default function AgentCommandCenter() {
   const [clientFilter, setClientFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [appointmentId, setAppointmentId] = useState('');
-  const [showLaterAppointments, setShowLaterAppointments] = useState(false);
 
-  const [objective, setObjective] = useState('Collect logistics updates and keep client informed of ETA.');
-  const [questionInput, setQuestionInput] = useState('Any access code changes?, Any pet/safety notes?');
-  const [duration, setDuration] = useState('30');
+  const [activeTab, setActiveTab] = useState<AgentDeskTab>('CHAT');
   const [commandInput, setCommandInput] = useState('');
   const [commandHistory, setCommandHistory] = useState<CommandHistoryItem[]>([]);
   const [runningCommand, setRunningCommand] = useState(false);
   const [chatExpanded, setChatExpanded] = useState(false);
-  const { height: viewportHeight } = useWindowDimensions();
+  const { height: viewportHeight, width: viewportWidth } = useWindowDimensions();
 
   const [checkDefinitions, setCheckDefinitions] = useState<CheckDefinition[]>([]);
   const [readinessChecks, setReadinessChecks] = useState<ReadinessCheckRow[]>([]);
@@ -113,13 +111,14 @@ export default function AgentCommandCenter() {
 
   const [clientModalOpen, setClientModalOpen] = useState(false);
   const [dateModalOpen, setDateModalOpen] = useState(false);
+  const [appointmentModalOpen, setAppointmentModalOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
 
   useEffect(() => {
-    loadAll();
+    void loadAll();
   }, []);
 
   useEffect(() => {
@@ -127,8 +126,7 @@ export default function AgentCommandCenter() {
       setReadinessChecks([]);
       return;
     }
-
-    loadReadiness(appointmentId);
+    void loadReadiness(appointmentId);
   }, [appointmentId]);
 
   const sortedAppointments = useMemo(() => {
@@ -165,8 +163,8 @@ export default function AgentCommandCenter() {
     });
   }, [sortedAppointments, clientFilter, dateFilter]);
 
-  const { operationalAppointments, laterAppointments } = useMemo(
-    () => splitAppointmentsByOperationalWindow(filteredAppointments),
+  const operationalAppointments = useMemo(
+    () => splitAppointmentsByOperationalWindow(filteredAppointments).operationalAppointments,
     [filteredAppointments],
   );
 
@@ -191,6 +189,38 @@ export default function AgentCommandCenter() {
     [readinessChecks],
   );
 
+  const readinessSortedChecks = useMemo(() => {
+    const score = (check: ReadinessCheckRow): number => {
+      if (check.critical && check.status === 'FAIL') return 0;
+      if (check.status === 'PENDING') return 1;
+      if (!check.critical && check.status === 'FAIL') return 2;
+      return 3;
+    };
+    return [...readinessChecks].sort((a, b) => {
+      const scoreA = score(a);
+      const scoreB = score(b);
+      if (scoreA !== scoreB) return scoreA - scoreB;
+      return String(a.check_type).localeCompare(String(b.check_type));
+    });
+  }, [readinessChecks]);
+
+  const readinessSummary = useMemo(() => {
+    const total = readinessChecks.length;
+    const passCount = readinessChecks.filter((check) => check.status === 'PASS').length;
+    const blockerCount = criticalFailedChecks.length;
+    const latestUpdatedAt = readinessChecks
+      .map((check) => Date.parse(String(check.updated_at || '')))
+      .filter((value) => Number.isFinite(value))
+      .reduce<number | null>((max, value) => (max === null || value > max ? value : max), null);
+
+    return {
+      total,
+      passCount,
+      blockerCount,
+      latestUpdatedAt: latestUpdatedAt ? new Date(latestUpdatedAt).toLocaleString() : 'No updates yet',
+    };
+  }, [readinessChecks, criticalFailedChecks]);
+
   useEffect(() => {
     const selectionPool = operationalAppointments.length > 0 ? operationalAppointments : filteredAppointments;
     if (!selectionPool.length) {
@@ -202,12 +232,6 @@ export default function AgentCommandCenter() {
       setAppointmentId(selectionPool[0].id);
     }
   }, [operationalAppointments, filteredAppointments, appointmentId]);
-
-  useEffect(() => {
-    if (dateFilter) {
-      setShowLaterAppointments(true);
-    }
-  }, [dateFilter]);
 
   const loadAll = async () => {
     await Promise.all([loadAppointments(), loadDelegations(), loadSummaries(), loadCheckDefinitions(), loadAgentDeskHistory()]);
@@ -278,6 +302,15 @@ export default function AgentCommandCenter() {
     }
   };
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (runningCommand) return;
+      void loadAgentDeskHistory();
+    }, 4000);
+
+    return () => clearInterval(interval);
+  }, [userId, authToken, runningCommand]);
+
   const loadReadiness = async (apptId: string) => {
     try {
       setLoadingChecks(true);
@@ -316,9 +349,7 @@ export default function AgentCommandCenter() {
     const forceStart = Boolean(options?.forceStart);
     const appendCaregiverMessage = options?.appendCaregiverMessage !== false;
 
-    if (!commandText.trim()) {
-      return;
-    }
+    if (!commandText.trim()) return;
 
     if (appendCaregiverMessage) {
       appendCommandHistory({ actor: 'CAREGIVER', text: commandText.trim() });
@@ -331,7 +362,7 @@ export default function AgentCommandCenter() {
         {
           command: commandText.trim(),
           appointmentId: appointmentId || undefined,
-          durationMinutes: Number(duration) || 30,
+          durationMinutes: 30,
           forceStart,
         },
         { headers: authHeaders },
@@ -393,11 +424,7 @@ export default function AgentCommandCenter() {
       }
 
       const responseText = String(error?.response?.data?.error || 'Could not process agent command.');
-      appendCommandHistory({
-        actor: 'AGENT',
-        text: responseText,
-        mode: 'SUGGESTION',
-      });
+      appendCommandHistory({ actor: 'AGENT', text: responseText, mode: 'SUGGESTION' });
       Alert.alert('Error', responseText);
     } finally {
       setRunningCommand(false);
@@ -406,18 +433,13 @@ export default function AgentCommandCenter() {
 
   const sendCommand = async () => {
     const text = commandInput.trim();
-    if (!text) {
-      return;
-    }
-
+    if (!text) return;
     setCommandInput('');
     await runAgentCommandRequest(text, { appendCaregiverMessage: true });
   };
 
   const updateReadinessCheck = async (checkType: string, status: 'PENDING' | 'PASS' | 'FAIL') => {
-    if (!appointmentId) {
-      return;
-    }
+    if (!appointmentId) return;
 
     try {
       setUpdatingCheckKey(checkType);
@@ -441,68 +463,6 @@ export default function AgentCommandCenter() {
     }
   };
 
-  const submitDelegation = async (forceStart: boolean) => {
-    const questions = questionInput
-      .split(',')
-      .map((q) => q.trim())
-      .filter(Boolean);
-
-    return axios.post(
-      `${API_BASE_URL}/agents/${userId}/delegations/start`,
-      {
-        appointmentId,
-        objective: objective.trim(),
-        durationMinutes: Number(duration) || 30,
-        questions,
-        forceStart,
-      },
-      { headers: authHeaders },
-    );
-  };
-
-  const startDelegation = async () => {
-    if (!appointmentId || !objective.trim()) {
-      Alert.alert('Missing details', 'Choose a visit and objective before delegating.');
-      return;
-    }
-
-    try {
-      await submitDelegation(false);
-      await loadAll();
-      Alert.alert('Delegation started', 'Agent is now handling this conversation window.');
-    } catch (error: any) {
-      const status = error?.response?.status;
-      if (status === 409) {
-        const failedChecks = error?.response?.data?.failedChecks || [];
-        Alert.alert(
-          'Critical Readiness Blocker',
-          `Cannot start delegation yet. Failed critical checks: ${failedChecks.join(', ') || 'Unknown'}.`,
-          [
-            { text: 'Cancel', style: 'cancel' },
-            {
-              text: 'Force Start',
-              style: 'destructive',
-              onPress: async () => {
-                try {
-                  await submitDelegation(true);
-                  await loadAll();
-                  Alert.alert('Delegation started', 'Started with force override.');
-                } catch (forceErr) {
-                  console.error('Failed to force start delegation', forceErr);
-                  Alert.alert('Error', 'Could not force start delegation.');
-                }
-              },
-            },
-          ],
-        );
-        return;
-      }
-
-      console.error('Failed to start delegation', error);
-      Alert.alert('Error', 'Could not start delegation.');
-    }
-  };
-
   const stopDelegation = async (apptId: string) => {
     try {
       await axios.post(`${API_BASE_URL}/agents/${userId}/delegations/${apptId}/stop`, {}, { headers: authHeaders });
@@ -516,12 +476,63 @@ export default function AgentCommandCenter() {
 
   const selectedAppointment = appointmentLookup.get(appointmentId);
   const chatPanelHeight = Math.max(280, Math.floor(viewportHeight * 0.48));
+  const expandedChatPanelHeight = Math.max(360, Math.floor(viewportHeight * 0.62));
+  const isNarrowScreen = viewportWidth < 420;
 
-  const renderChatThread = () => (
-    <ScrollView style={[styles.chatThread, { height: chatPanelHeight }]} contentContainerStyle={styles.chatThreadContent}>
+  const renderTabSwitcher = () => (
+    <View style={styles.tabRow}>
+      <TouchableOpacity
+        style={[styles.tabBtn, activeTab === 'CHAT' && styles.tabBtnActive]}
+        onPress={() => setActiveTab('CHAT')}
+      >
+        <Text style={[styles.tabBtnText, activeTab === 'CHAT' && styles.tabBtnTextActive]}>Chat</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.tabBtn, activeTab === 'OPERATIONS' && styles.tabBtnActive]}
+        onPress={() => setActiveTab('OPERATIONS')}
+      >
+        <Text style={[styles.tabBtnText, activeTab === 'OPERATIONS' && styles.tabBtnTextActive]}>Operations</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  const renderContextHeader = () => (
+    <View style={styles.contextHeader}>
+      <View style={[styles.contextHeaderMainRow, isNarrowScreen && styles.contextHeaderMainRowStacked]}>
+        <View style={styles.contextHeaderTextWrap}>
+          <Text style={styles.contextHeaderLabel}>Current Context</Text>
+          <Text style={styles.contextHeaderTitle}>
+            {selectedAppointment
+              ? `${selectedAppointment.client_name} • ${formatDateTime(selectedAppointment.start_time)}`
+              : 'No visit selected'}
+          </Text>
+          <Text style={styles.contextHeaderHint}>Use Switch to change appointment quickly.</Text>
+        </View>
+        <TouchableOpacity style={[styles.contextSwitchBtn, isNarrowScreen && styles.contextSwitchBtnStacked]} onPress={() => setAppointmentModalOpen(true)}>
+          <Text style={styles.contextSwitchBtnText}>Switch</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={[styles.contextFilterRow, isNarrowScreen && styles.contextFilterRowStacked]}>
+        <TouchableOpacity style={[styles.contextFilterPill, isNarrowScreen && styles.contextFilterPillStacked]} onPress={() => setClientModalOpen(true)}>
+          <Text style={styles.contextFilterLabel}>Client</Text>
+          <Text style={styles.contextFilterValue}>{clientFilter || 'All clients'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.contextFilterPill, isNarrowScreen && styles.contextFilterPillStacked]} onPress={() => setDateModalOpen(true)}>
+          <Text style={styles.contextFilterLabel}>Date</Text>
+          <Text style={styles.contextFilterValue}>{dateFilter ? formatDateLabel(dateFilter) : 'Any date'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.contextFilterClear, isNarrowScreen && styles.contextFilterClearStacked]} onPress={clearFilters}>
+          <Text style={styles.contextFilterClearText}>Clear</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
+  const renderChatThread = (height: number = chatPanelHeight) => (
+    <ScrollView style={[styles.chatThread, { height }]} contentContainerStyle={styles.chatThreadContent}>
       {commandHistory.length === 0 ? (
         <Text style={styles.commandPlaceholder}>
-          Ask naturally. Examples: What is my day looking like? Do I have any gaps between visits? Start checking if access has changed.
+          Ask naturally. Examples: What is my day looking like? Do I have any gaps between visits? Please contact family and confirm access updates.
         </Text>
       ) : null}
       {commandHistory.map((item) => {
@@ -559,214 +570,207 @@ export default function AgentCommandCenter() {
         placeholderTextColor={DS.colors.textMuted}
         multiline
       />
-      <TouchableOpacity style={[styles.primaryBtn, runningCommand && styles.primaryBtnDisabled]} onPress={sendCommand} disabled={runningCommand}>
+      <TouchableOpacity
+        style={[styles.primaryBtn, runningCommand && styles.primaryBtnDisabled]}
+        onPress={sendCommand}
+        disabled={runningCommand}
+      >
         <Text style={styles.primaryBtnText}>{runningCommand ? 'Working...' : 'Send'}</Text>
       </TouchableOpacity>
     </View>
+  );
+
+  const renderChatTab = () => (
+    <View style={styles.panel}>
+      <View style={styles.chatHeaderRow}>
+        <View style={styles.chatHeaderTextWrap}>
+          <Text style={styles.panelTitle}>Caregiver Chat</Text>
+          <Text style={styles.commandContextText}>Start delegation by asking in chat. Example: “Please contact family and ask about access updates.”</Text>
+        </View>
+        <TouchableOpacity style={styles.chatExpandBtn} onPress={() => setChatExpanded(true)}>
+          <Text style={styles.chatExpandBtnText}>Open Fullscreen</Text>
+        </TouchableOpacity>
+      </View>
+      {renderChatThread()}
+      {renderChatComposer()}
+    </View>
+  );
+
+  const renderReadinessPanel = () => (
+    <View style={styles.panel}>
+      <Text style={styles.panelTitle}>Readiness</Text>
+      {!appointmentId ? <Text style={styles.emptyText}>Select a visit in Current Context to view readiness.</Text> : null}
+      {!appointmentId ? null : (
+        <>
+          <View style={styles.readinessSummaryStrip}>
+            <View style={styles.readinessMetric}>
+              <Text style={styles.readinessMetricLabel}>Critical blockers</Text>
+              <Text style={[styles.readinessMetricValue, readinessSummary.blockerCount > 0 && styles.readinessMetricDanger]}>
+                {readinessSummary.blockerCount}
+              </Text>
+            </View>
+            <View style={styles.readinessMetric}>
+              <Text style={styles.readinessMetricLabel}>Checks passed</Text>
+              <Text style={styles.readinessMetricValue}>
+                {readinessSummary.passCount}/{readinessSummary.total}
+              </Text>
+            </View>
+          </View>
+          <Text style={styles.readinessUpdated}>Last updated: {readinessSummary.latestUpdatedAt}</Text>
+
+          {criticalFailedChecks.length > 0 ? (
+            <Text style={styles.blockerText}>
+              Critical blockers: {criticalFailedChecks.map((c) => c.check_type.replace(/_/g, ' ')).join(', ')}
+            </Text>
+          ) : (
+            <Text style={styles.hintText}>No critical blockers detected.</Text>
+          )}
+
+          {loadingChecks ? (
+            <View style={styles.loaderInline}>
+              <ActivityIndicator size="small" color={DS.colors.brand} />
+            </View>
+          ) : readinessSortedChecks.length === 0 ? (
+            <Text style={styles.emptyText}>No readiness checks found for this appointment.</Text>
+          ) : (
+            readinessSortedChecks.map((check) => (
+              <View key={check.check_type} style={styles.checkRow}>
+                <View style={styles.checkHeader}>
+                  <Text style={styles.checkName}>{check.check_type.replace(/_/g, ' ')}</Text>
+                  <Text style={[styles.checkStatus, statusTone(check.status)]}>{check.status}</Text>
+                </View>
+                <Text style={styles.checkDesc}>
+                  {check.description || checkDefinitions.find((d) => d.key === check.check_type)?.description || ''}
+                </Text>
+                {check.critical ? <Text style={styles.criticalBadge}>Critical</Text> : null}
+
+                <View style={styles.checkActions}>
+                  {(['PASS', 'PENDING', 'FAIL'] as const).map((status) => {
+                    const active = check.status === status;
+                    const pendingUpdate = updatingCheckKey === check.check_type;
+                    return (
+                      <TouchableOpacity
+                        key={`${check.check_type}-${status}`}
+                        style={[styles.actionBtn, active && styles.actionBtnActive]}
+                        onPress={() => updateReadinessCheck(check.check_type, status)}
+                        disabled={pendingUpdate}
+                      >
+                        <Text style={[styles.actionBtnText, active && styles.actionBtnTextActive]}>
+                          {pendingUpdate ? '...' : status}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </View>
+            ))
+          )}
+        </>
+      )}
+    </View>
+  );
+
+  const renderActiveDelegations = () => (
+    <>
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionTitle}>Active Delegations</Text>
+      </View>
+      {filteredActiveDelegations.length === 0 ? <Text style={styles.emptyText}>No active delegations.</Text> : null}
+      {filteredActiveDelegations.map((item) => {
+        const appt = appointmentLookup.get(item.appointmentId);
+        return (
+          <View key={`active-${item.appointmentId}`} style={styles.card}>
+            <Text style={styles.cardTitle}>{item.clientName || appt?.client_name || item.appointmentId}</Text>
+            <Text style={styles.cardMeta}>Appointment: {formatDateTime(item.appointmentStartTime || appt?.start_time)}</Text>
+            <Text style={styles.cardMeta}>Objective: {item.objective}</Text>
+            <Text style={styles.cardMeta}>Ends: {new Date(item.endsAt).toLocaleTimeString()}</Text>
+            <TouchableOpacity style={styles.secondaryBtn} onPress={() => stopDelegation(item.appointmentId)}>
+              <Text style={styles.secondaryBtnText}>End + Generate Summary</Text>
+            </TouchableOpacity>
+          </View>
+        );
+      })}
+    </>
+  );
+
+  const renderRecentSummaries = () => (
+    <>
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionTitle}>Recent Summaries</Text>
+      </View>
+      {filteredSummaries.length === 0 ? <Text style={styles.emptyText}>No summaries yet.</Text> : null}
+      {filteredSummaries.map((item) => (
+        <View key={`${item.appointmentId}-${item.summaryGeneratedAt}`} style={styles.card}>
+          <Text style={styles.cardTitle}>{item.clientName || item.appointmentId}</Text>
+          <Text style={styles.cardMeta}>Appointment: {formatDateTime(item.appointmentStartTime)}</Text>
+          <Text style={styles.cardMeta}>{item.summaryGeneratedAt ? new Date(item.summaryGeneratedAt).toLocaleString() : ''}</Text>
+          <Text style={styles.summaryText}>{item.summary}</Text>
+        </View>
+      ))}
+    </>
+  );
+
+  const renderOperationsTab = () => (
+    <>
+      {renderReadinessPanel()}
+      {renderActiveDelegations()}
+      {renderRecentSummaries()}
+    </>
   );
 
   return (
     <View style={styles.container}>
       <Stack.Screen options={{ title: 'Agent Desk' }} />
 
-      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-        <View style={styles.panel}>
-          <View style={styles.chatHeaderRow}>
-            <View>
-              <Text style={styles.panelTitle}>Caregiver Chat</Text>
-              <Text style={styles.commandContextText}>
-                Context: {selectedAppointment ? `${selectedAppointment.client_name} • ${formatDateTime(selectedAppointment.start_time)}` : 'No visit selected'}
-              </Text>
-            </View>
-            <TouchableOpacity style={styles.chatExpandBtn} onPress={() => setChatExpanded(true)}>
-              <Text style={styles.chatExpandBtnText}>Expand</Text>
-            </TouchableOpacity>
+      <View style={styles.stickyHeaderOuter}>
+        <View style={styles.contentClamp}>
+          <View style={styles.stickyHeader}>
+            {renderContextHeader()}
+            {renderTabSwitcher()}
           </View>
-          {renderChatThread()}
-          {renderChatComposer()}
         </View>
+      </View>
+      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+        <View style={styles.contentClamp}>{activeTab === 'CHAT' ? renderChatTab() : renderOperationsTab()}</View>
+      </ScrollView>
 
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Structured Delegation (Manual)</Text>
-
-          <View style={styles.filterBar}>
-            <TouchableOpacity style={styles.filterPill} onPress={() => setClientModalOpen(true)}>
-              <Text style={styles.filterLabel}>Client</Text>
-              <Text style={styles.filterValue}>{clientFilter || 'All clients'}</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.filterPill} onPress={() => setDateModalOpen(true)}>
-              <Text style={styles.filterLabel}>Date</Text>
-              <Text style={styles.filterValue}>{dateFilter ? formatDateLabel(dateFilter) : 'Any date'}</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.clearFilterPill} onPress={clearFilters}>
-              <Text style={styles.clearFilterText}>Clear</Text>
-            </TouchableOpacity>
-          </View>
-
-          <Text style={styles.label}>Choose Visit</Text>
-          <View style={styles.groupHeaderRow}>
-            <Text style={styles.groupTitle}>Current & Soon</Text>
-            <Text style={styles.groupMeta}>Operational window</Text>
-          </View>
-          {operationalAppointments.map((item) => {
-            const selected = item.id === appointmentId;
-            return (
-              <TouchableOpacity
-                key={item.id}
-                onPress={() => setAppointmentId(item.id)}
-                style={[styles.appointmentRow, selected && styles.appointmentRowSelected]}
-              >
-                <Text style={[styles.appointmentRowTitle, selected && styles.appointmentRowTitleSelected]}>
-                  {item.client_name} • {formatDateTime(item.start_time)}
-                </Text>
-                <Text style={[styles.appointmentRowMeta, selected && styles.appointmentRowMetaSelected]}>
-                  {item.service_type || 'Service'}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-          {operationalAppointments.length === 0 ? <Text style={styles.emptyText}>No visits in the operational window.</Text> : null}
-
-          {laterAppointments.length > 0 ? (
-            <View style={styles.groupHeaderRow}>
-              <Text style={styles.groupTitle}>Later Appointments</Text>
-              <TouchableOpacity style={styles.groupToggleBtn} onPress={() => setShowLaterAppointments((prev) => !prev)}>
-                <Text style={styles.groupToggleBtnText}>{showLaterAppointments ? 'Hide' : `Show (${laterAppointments.length})`}</Text>
-              </TouchableOpacity>
-            </View>
-          ) : null}
-          {showLaterAppointments
-            ? laterAppointments.map((item) => {
+      <Modal visible={appointmentModalOpen} animationType="slide" transparent onRequestClose={() => setAppointmentModalOpen(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Switch Appointment Context</Text>
+            <ScrollView style={styles.modalList}>
+              {filteredAppointments.length === 0 ? (
+                <>
+                  <Text style={styles.emptyText}>No visits for active filters.</Text>
+                  <TouchableOpacity style={styles.modalCloseBtn} onPress={clearFilters}>
+                    <Text style={styles.modalCloseText}>Clear filters</Text>
+                  </TouchableOpacity>
+                </>
+              ) : null}
+              {filteredAppointments.map((item) => {
                 const selected = item.id === appointmentId;
                 return (
                   <TouchableOpacity
-                    key={`later-${item.id}`}
-                    onPress={() => setAppointmentId(item.id)}
-                    style={[styles.appointmentRow, selected && styles.appointmentRowSelected]}
+                    key={`context-${item.id}`}
+                    style={[styles.modalOption, selected && styles.modalOptionSelected]}
+                    onPress={() => {
+                      setAppointmentId(item.id);
+                      setAppointmentModalOpen(false);
+                    }}
                   >
-                    <Text style={[styles.appointmentRowTitle, selected && styles.appointmentRowTitleSelected]}>
+                    <Text style={[styles.modalOptionText, selected && styles.modalOptionTextSelected]}>
                       {item.client_name} • {formatDateTime(item.start_time)}
-                    </Text>
-                    <Text style={[styles.appointmentRowMeta, selected && styles.appointmentRowMetaSelected]}>
-                      {item.service_type || 'Service'}
                     </Text>
                   </TouchableOpacity>
                 );
-              })
-            : null}
-          {filteredAppointments.length === 0 ? <Text style={styles.emptyText}>No visits for these filters.</Text> : null}
-
-          <View style={styles.checklistSection}>
-            <Text style={styles.checklistTitle}>Readiness Checklist</Text>
-            {criticalFailedChecks.length > 0 ? (
-              <Text style={styles.blockerText}>
-                Critical blockers: {criticalFailedChecks.map((c) => c.check_type).join(', ')}
-              </Text>
-            ) : (
-              <Text style={styles.hintText}>No critical blockers detected.</Text>
-            )}
-
-            {loadingChecks ? (
-              <View style={styles.loaderInline}>
-                <ActivityIndicator size="small" color={DS.colors.brand} />
-              </View>
-            ) : (
-              readinessChecks.map((check) => (
-                <View key={check.check_type} style={styles.checkRow}>
-                  <View style={styles.checkHeader}>
-                    <Text style={styles.checkName}>{check.check_type.replace(/_/g, ' ')}</Text>
-                    <Text style={[styles.checkStatus, statusTone(check.status)]}>{check.status}</Text>
-                  </View>
-                  <Text style={styles.checkDesc}>
-                    {check.description || checkDefinitions.find((d) => d.key === check.check_type)?.description || ''}
-                  </Text>
-                  {check.critical ? <Text style={styles.criticalBadge}>Critical</Text> : null}
-
-                  <View style={styles.checkActions}>
-                    {(['PASS', 'PENDING', 'FAIL'] as const).map((status) => {
-                      const active = check.status === status;
-                      const pendingUpdate = updatingCheckKey === check.check_type;
-                      return (
-                        <TouchableOpacity
-                          key={`${check.check_type}-${status}`}
-                          style={[styles.actionBtn, active && styles.actionBtnActive]}
-                          onPress={() => updateReadinessCheck(check.check_type, status)}
-                          disabled={pendingUpdate}
-                        >
-                          <Text style={[styles.actionBtnText, active && styles.actionBtnTextActive]}>
-                            {pendingUpdate ? '...' : status}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                </View>
-              ))
-            )}
+              })}
+            </ScrollView>
+            <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setAppointmentModalOpen(false)}>
+              <Text style={styles.modalCloseText}>Done</Text>
+            </TouchableOpacity>
           </View>
-
-          <Text style={styles.label}>Objective</Text>
-          <TextInput
-            style={styles.input}
-            value={objective}
-            onChangeText={setObjective}
-            placeholder="What should the agent handle?"
-            placeholderTextColor={DS.colors.textMuted}
-          />
-
-          <Text style={styles.label}>Questions To Ask (comma separated)</Text>
-          <TextInput
-            style={styles.input}
-            value={questionInput}
-            onChangeText={setQuestionInput}
-            placeholder="What should the agent ask the client?"
-            placeholderTextColor={DS.colors.textMuted}
-          />
-
-          <Text style={styles.label}>Duration (minutes)</Text>
-          <TextInput style={styles.input} keyboardType="numeric" value={duration} onChangeText={setDuration} />
-
-          <TouchableOpacity style={styles.primaryBtn} onPress={startDelegation}>
-            <Text style={styles.primaryBtnText}>Start Delegation</Text>
-          </TouchableOpacity>
         </View>
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Active Delegations</Text>
-        </View>
-        {filteredActiveDelegations.length === 0 ? <Text style={styles.emptyText}>No active delegations.</Text> : null}
-        {filteredActiveDelegations.map((item) => {
-          const appt = appointmentLookup.get(item.appointmentId);
-          return (
-            <View key={`active-${item.appointmentId}`} style={styles.card}>
-              <Text style={styles.cardTitle}>{item.clientName || appt?.client_name || item.appointmentId}</Text>
-              <Text style={styles.cardMeta}>Appointment: {formatDateTime(item.appointmentStartTime || appt?.start_time)}</Text>
-              <Text style={styles.cardMeta}>Objective: {item.objective}</Text>
-              <Text style={styles.cardMeta}>Ends: {new Date(item.endsAt).toLocaleTimeString()}</Text>
-              <TouchableOpacity style={styles.secondaryBtn} onPress={() => stopDelegation(item.appointmentId)}>
-                <Text style={styles.secondaryBtnText}>End + Generate Summary</Text>
-              </TouchableOpacity>
-            </View>
-          );
-        })}
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Recent Summaries</Text>
-        </View>
-        {filteredSummaries.length === 0 ? <Text style={styles.emptyText}>No summaries yet.</Text> : null}
-        {filteredSummaries.map((item) => (
-          <View key={`${item.appointmentId}-${item.summaryGeneratedAt}`} style={styles.card}>
-            <Text style={styles.cardTitle}>{item.clientName || item.appointmentId}</Text>
-            <Text style={styles.cardMeta}>Appointment: {formatDateTime(item.appointmentStartTime)}</Text>
-            <Text style={styles.cardMeta}>
-              {item.summaryGeneratedAt ? new Date(item.summaryGeneratedAt).toLocaleString() : ''}
-            </Text>
-            <Text style={styles.summaryText}>{item.summary}</Text>
-          </View>
-        ))}
-      </ScrollView>
+      </Modal>
 
       <Modal visible={clientModalOpen} animationType="slide" transparent onRequestClose={() => setClientModalOpen(false)}>
         <View style={styles.modalBackdrop}>
@@ -872,16 +876,23 @@ export default function AgentCommandCenter() {
         </View>
       </Modal>
 
-      <Modal visible={chatExpanded} animationType="slide" onRequestClose={() => setChatExpanded(false)}>
+      <Modal visible={chatExpanded} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setChatExpanded(false)}>
         <View style={styles.chatExpandedContainer}>
           <View style={styles.chatExpandedHeader}>
+            <TouchableOpacity style={styles.chatBackBtn} onPress={() => setChatExpanded(false)}>
+              <Text style={styles.chatBackBtnText}>Back</Text>
+            </TouchableOpacity>
             <Text style={styles.chatExpandedTitle}>Caregiver Chat</Text>
             <TouchableOpacity style={styles.chatCollapseBtn} onPress={() => setChatExpanded(false)}>
-              <Text style={styles.chatCollapseBtnText}>Done</Text>
+              <Text style={styles.chatCollapseBtnText}>Close</Text>
             </TouchableOpacity>
           </View>
-          {renderChatThread()}
+          <Text style={styles.chatExpandedHint}>Fullscreen mode active. Use Back or Close anytime.</Text>
+          {renderChatThread(expandedChatPanelHeight)}
           {renderChatComposer()}
+          <TouchableOpacity style={styles.chatExitBtn} onPress={() => setChatExpanded(false)}>
+            <Text style={styles.chatExitBtnText}>Exit Fullscreen</Text>
+          </TouchableOpacity>
         </View>
       </Modal>
     </View>
@@ -983,9 +994,157 @@ const styles = StyleSheet.create({
   container: {
     ...baseStyles.screen,
   },
+  contentClamp: {
+    width: '100%',
+    maxWidth: 820,
+    alignSelf: 'center',
+  },
+  stickyHeaderOuter: {
+    paddingHorizontal: DS.spacing.md,
+    paddingTop: DS.spacing.md,
+    paddingBottom: DS.spacing.xs,
+    backgroundColor: DS.colors.canvas,
+    borderBottomWidth: 1,
+    borderBottomColor: DS.colors.border,
+  },
+  stickyHeader: {
+    width: '100%',
+    paddingHorizontal: 0,
+  },
   scrollContent: {
     padding: DS.spacing.md,
     paddingBottom: DS.spacing.xl,
+    alignItems: 'center',
+  },
+  contextHeader: {
+    ...baseStyles.card,
+    gap: DS.spacing.sm,
+    marginBottom: DS.spacing.sm,
+    padding: DS.spacing.md,
+  },
+  contextHeaderMainRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: DS.spacing.sm,
+  },
+  contextHeaderMainRowStacked: {
+    flexDirection: 'column',
+    alignItems: 'stretch',
+  },
+  contextHeaderTextWrap: {
+    flex: 1,
+  },
+  contextHeaderLabel: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    fontWeight: '700',
+  },
+  contextHeaderTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  contextHeaderHint: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.micro,
+    marginTop: 2,
+  },
+  contextSwitchBtn: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
+    backgroundColor: DS.colors.surface,
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  contextSwitchBtnStacked: {
+    alignSelf: 'flex-start',
+  },
+  contextSwitchBtnText: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  contextFilterRow: {
+    flexDirection: 'row',
+    gap: DS.spacing.xs,
+    alignItems: 'stretch',
+  },
+  contextFilterRowStacked: {
+    flexDirection: 'column',
+  },
+  contextFilterPill: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
+    minHeight: 56,
+    justifyContent: 'center',
+  },
+  contextFilterPillStacked: {
+    flex: 0,
+  },
+  contextFilterLabel: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+  },
+  contextFilterValue: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+    marginTop: 1,
+  },
+  contextFilterClear: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    paddingHorizontal: DS.spacing.md,
+    paddingVertical: DS.spacing.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 56,
+  },
+  contextFilterClearStacked: {
+    width: '100%',
+  },
+  contextFilterClearText: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  tabRow: {
+    flexDirection: 'row',
+    gap: DS.spacing.xs,
+    marginBottom: DS.spacing.sm,
+  },
+  tabBtn: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    alignItems: 'center',
+    paddingVertical: DS.spacing.xs,
+  },
+  tabBtnActive: {
+    borderColor: DS.colors.brand,
+    backgroundColor: '#DFF3EF',
+  },
+  tabBtnText: {
+    color: DS.colors.textSecondary,
+    fontWeight: '700',
+    fontSize: DS.typography.caption,
+  },
+  tabBtnTextActive: {
+    color: DS.colors.brandStrong,
   },
   panel: {
     ...baseStyles.card,
@@ -998,10 +1157,84 @@ const styles = StyleSheet.create({
     fontSize: DS.typography.subtitle,
     marginBottom: DS.spacing.sm,
   },
+  chatHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: DS.spacing.sm,
+    marginBottom: DS.spacing.xs,
+  },
+  chatHeaderTextWrap: {
+    flex: 1,
+  },
   commandContextText: {
     color: DS.colors.textSecondary,
     fontSize: DS.typography.caption,
-    marginBottom: DS.spacing.xs,
+    lineHeight: 18,
+  },
+  chatExpandBtn: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 6,
+    backgroundColor: DS.colors.surface,
+    minHeight: 36,
+    justifyContent: 'center',
+  },
+  chatExpandBtnText: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  chatThread: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: '#F7FBFA',
+    marginTop: DS.spacing.xs,
+  },
+  chatThreadContent: {
+    padding: DS.spacing.sm,
+    gap: DS.spacing.xs,
+  },
+  chatComposer: {
+    marginTop: DS.spacing.sm,
+  },
+  commandPlaceholder: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+  },
+  chatRow: {
+    borderRadius: DS.radius.sm,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: DS.spacing.xs,
+  },
+  chatRowCaregiver: {
+    backgroundColor: '#E9F6F3',
+    borderWidth: 1,
+    borderColor: '#C8E8E1',
+    alignSelf: 'flex-end',
+    maxWidth: '92%',
+  },
+  chatRowAgent: {
+    backgroundColor: DS.colors.surface,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    alignSelf: 'flex-start',
+    maxWidth: '96%',
+  },
+  chatRowMeta: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    marginBottom: 2,
+    fontWeight: '700',
+  },
+  chatRowText: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
   },
   filterBar: {
     flexDirection: 'row',
@@ -1041,6 +1274,12 @@ const styles = StyleSheet.create({
     fontSize: DS.typography.caption,
     fontWeight: '700',
   },
+  label: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    marginTop: DS.spacing.xs,
+    marginBottom: DS.spacing.xxs,
+  },
   groupHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1071,12 +1310,6 @@ const styles = StyleSheet.create({
     fontSize: DS.typography.caption,
     fontWeight: '700',
   },
-  label: {
-    color: DS.colors.textSecondary,
-    fontSize: DS.typography.caption,
-    marginTop: DS.spacing.xs,
-    marginBottom: DS.spacing.xxs,
-  },
   appointmentRow: {
     borderWidth: 1,
     borderColor: DS.colors.border,
@@ -1106,19 +1339,36 @@ const styles = StyleSheet.create({
   appointmentRowMetaSelected: {
     color: DS.colors.brandStrong,
   },
-  checklistSection: {
-    marginTop: DS.spacing.sm,
+  readinessSummaryStrip: {
+    flexDirection: 'row',
+    gap: DS.spacing.xs,
     marginBottom: DS.spacing.xs,
+  },
+  readinessMetric: {
+    flex: 1,
     borderWidth: 1,
     borderColor: DS.colors.border,
     borderRadius: DS.radius.sm,
     backgroundColor: '#F7FBFA',
-    padding: DS.spacing.sm,
+    padding: DS.spacing.xs,
   },
-  checklistTitle: {
+  readinessMetricLabel: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    fontWeight: '700',
+  },
+  readinessMetricValue: {
     color: DS.colors.textPrimary,
     fontSize: DS.typography.caption,
     fontWeight: '800',
+    marginTop: 2,
+  },
+  readinessMetricDanger: {
+    color: DS.colors.danger,
+  },
+  readinessUpdated: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.micro,
     marginBottom: DS.spacing.xs,
   },
   blockerText: {
@@ -1246,14 +1496,216 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: DS.typography.body,
   },
-  chatHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    gap: DS.spacing.sm,
+  sectionHeader: {
+    marginTop: DS.spacing.xs,
     marginBottom: DS.spacing.xs,
   },
-  chatExpandBtn: {
+  sectionTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+  },
+  emptyText: {
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.caption,
+    marginBottom: DS.spacing.sm,
+  },
+  card: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    padding: DS.spacing.sm,
+    marginBottom: DS.spacing.sm,
+  },
+  cardTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.body,
+    fontWeight: '800',
+    marginBottom: DS.spacing.xxs,
+  },
+  cardMeta: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    marginBottom: 4,
+  },
+  summaryText: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+    marginTop: DS.spacing.xs,
+  },
+  secondaryBtn: {
+    marginTop: DS.spacing.sm,
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: DS.colors.brand,
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 6,
+    backgroundColor: '#E9F6F3',
+  },
+  secondaryBtnText: {
+    color: DS.colors.brandStrong,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'center',
+    padding: DS.spacing.md,
+  },
+  modalCard: {
+    ...baseStyles.card,
+    maxHeight: '86%',
+    padding: DS.spacing.md,
+  },
+  modalTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    marginBottom: DS.spacing.md,
+  },
+  modalList: {
+    maxHeight: 320,
+  },
+  modalOption: {
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    backgroundColor: DS.colors.surface,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: DS.spacing.sm,
+    marginBottom: DS.spacing.sm,
+  },
+  modalOptionSelected: {
+    borderColor: DS.colors.brand,
+    backgroundColor: '#DFF3EF',
+  },
+  modalOptionText: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  modalOptionTextSelected: {
+    color: DS.colors.brandStrong,
+  },
+  modalCloseBtn: {
+    marginTop: DS.spacing.sm,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    paddingVertical: DS.spacing.sm,
+    alignItems: 'center',
+    backgroundColor: DS.colors.surface,
+  },
+  modalCloseText: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  calendarHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: DS.spacing.sm,
+  },
+  calendarNav: {
+    width: 36,
+    height: 36,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: DS.colors.surface,
+  },
+  calendarNavText: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.body,
+    fontWeight: '700',
+  },
+  calendarTitle: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '800',
+  },
+  weekHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: DS.spacing.xs,
+  },
+  weekLabel: {
+    width: '14.2%',
+    textAlign: 'center',
+    color: DS.colors.textMuted,
+    fontSize: DS.typography.micro,
+    fontWeight: '700',
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: DS.spacing.sm,
+  },
+  dayCell: {
+    width: '14.2%',
+    aspectRatio: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: DS.radius.sm,
+    marginBottom: 4,
+  },
+  dayCellHasData: {
+    backgroundColor: '#F4F9F8',
+  },
+  dayCellSelected: {
+    backgroundColor: '#DFF3EF',
+  },
+  dayText: {
+    color: DS.colors.textPrimary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  dayTextDisabled: {
+    color: '#C2C7CF',
+    fontWeight: '500',
+  },
+  dayTextSelected: {
+    color: DS.colors.brandStrong,
+  },
+  modalActionRow: {
+    flexDirection: 'row',
+    gap: DS.spacing.xs,
+  },
+  modalGhostBtn: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
+    borderRadius: DS.radius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: DS.spacing.sm,
+  },
+  modalGhostText: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
+  },
+  chatExpandedContainer: {
+    ...baseStyles.screen,
+    paddingTop: DS.spacing.lg,
+    paddingHorizontal: DS.spacing.md,
+    paddingBottom: DS.spacing.md,
+  },
+  chatExpandedHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: DS.spacing.xs,
+    gap: DS.spacing.xs,
+  },
+  chatBackBtn: {
     borderWidth: 1,
     borderColor: DS.colors.border,
     borderRadius: DS.radius.pill,
@@ -1261,72 +1713,17 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     backgroundColor: DS.colors.surface,
   },
-  chatExpandBtnText: {
+  chatBackBtnText: {
     color: DS.colors.textSecondary,
     fontSize: DS.typography.caption,
     fontWeight: '700',
-  },
-  chatThread: {
-    borderWidth: 1,
-    borderColor: DS.colors.border,
-    borderRadius: DS.radius.sm,
-    backgroundColor: '#F7FBFA',
-    marginTop: DS.spacing.xs,
-  },
-  chatThreadContent: {
-    padding: DS.spacing.sm,
-    gap: DS.spacing.xs,
-  },
-  chatComposer: {
-    marginTop: DS.spacing.sm,
-  },
-  commandPlaceholder: {
-    color: DS.colors.textMuted,
-    fontSize: DS.typography.caption,
-    lineHeight: 18,
-  },
-  chatRow: {
-    borderRadius: DS.radius.sm,
-    paddingHorizontal: DS.spacing.sm,
-    paddingVertical: DS.spacing.xs,
-  },
-  chatRowCaregiver: {
-    backgroundColor: '#E8F2FF',
-    alignSelf: 'flex-end',
-    maxWidth: '92%',
-  },
-  chatRowAgent: {
-    backgroundColor: '#F7FBFA',
-    borderWidth: 1,
-    borderColor: DS.colors.border,
-    alignSelf: 'flex-start',
-    maxWidth: '92%',
-  },
-  chatRowMeta: {
-    color: DS.colors.textSecondary,
-    fontSize: DS.typography.micro,
-    fontWeight: '700',
-    marginBottom: 2,
-  },
-  chatRowText: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.caption,
-    lineHeight: 18,
-  },
-  chatExpandedContainer: {
-    ...baseStyles.screen,
-    padding: DS.spacing.md,
-  },
-  chatExpandedHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: DS.spacing.sm,
   },
   chatExpandedTitle: {
     color: DS.colors.textPrimary,
-    fontWeight: '800',
     fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    flex: 1,
+    textAlign: 'center',
   },
   chatCollapseBtn: {
     borderWidth: 1,
@@ -1341,194 +1738,23 @@ const styles = StyleSheet.create({
     fontSize: DS.typography.caption,
     fontWeight: '700',
   },
-  sectionHeader: {
-    marginTop: DS.spacing.xs,
-    marginBottom: DS.spacing.xs,
-  },
-  sectionTitle: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.subtitle,
-    fontWeight: '800',
-  },
-  card: {
-    ...baseStyles.card,
-    padding: DS.spacing.md,
-    marginBottom: DS.spacing.xs,
-  },
-  cardTitle: {
-    color: DS.colors.textPrimary,
-    fontWeight: '700',
-    fontSize: DS.typography.body,
-    marginBottom: DS.spacing.xxs,
-  },
-  cardMeta: {
-    color: DS.colors.textSecondary,
-    fontSize: DS.typography.caption,
-    marginBottom: DS.spacing.xxs,
-  },
-  summaryText: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.caption,
-    lineHeight: 18,
-    marginTop: DS.spacing.xxs,
-  },
-  secondaryBtn: {
-    marginTop: DS.spacing.xs,
-    borderWidth: 1,
-    borderColor: DS.colors.brand,
-    borderRadius: DS.radius.sm,
-    paddingVertical: DS.spacing.xs,
-    alignItems: 'center',
-  },
-  secondaryBtnText: {
-    color: DS.colors.brand,
-    fontWeight: '700',
-  },
-  emptyText: {
-    color: DS.colors.textMuted,
-    fontSize: DS.typography.caption,
-    marginBottom: DS.spacing.sm,
-  },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(9, 23, 24, 0.36)',
-    justifyContent: 'flex-end',
-  },
-  modalCard: {
-    backgroundColor: DS.colors.surface,
-    borderTopLeftRadius: DS.radius.lg,
-    borderTopRightRadius: DS.radius.lg,
-    padding: DS.spacing.md,
-    maxHeight: '78%',
-  },
-  modalTitle: {
-    color: DS.colors.textPrimary,
-    fontWeight: '800',
-    fontSize: DS.typography.subtitle,
-    marginBottom: DS.spacing.sm,
-  },
-  modalList: {
-    maxHeight: 260,
-  },
-  modalOption: {
-    borderWidth: 1,
-    borderColor: DS.colors.border,
-    borderRadius: DS.radius.sm,
-    paddingVertical: DS.spacing.sm,
-    paddingHorizontal: DS.spacing.sm,
-    marginBottom: DS.spacing.xs,
-    backgroundColor: DS.colors.surface,
-  },
-  modalOptionSelected: {
-    borderColor: '#B3DCD5',
-    backgroundColor: '#DFF3EF',
-  },
-  modalOptionText: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.caption,
-    fontWeight: '600',
-  },
-  modalOptionTextSelected: {
-    color: DS.colors.brandStrong,
-  },
-  modalCloseBtn: {
-    backgroundColor: DS.colors.brand,
-    borderRadius: DS.radius.sm,
-    paddingVertical: DS.spacing.sm,
-    alignItems: 'center',
-    marginTop: DS.spacing.sm,
-    minWidth: 108,
-  },
-  modalCloseText: {
-    color: DS.colors.surface,
-    fontWeight: '700',
-    fontSize: DS.typography.caption,
-  },
-  modalActionRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginTop: DS.spacing.sm,
-  },
-  modalGhostBtn: {
-    borderWidth: 1,
-    borderColor: DS.colors.border,
-    borderRadius: DS.radius.sm,
-    paddingVertical: DS.spacing.sm,
-    paddingHorizontal: DS.spacing.md,
-    backgroundColor: DS.colors.surface,
-  },
-  modalGhostText: {
-    color: DS.colors.textSecondary,
-    fontSize: DS.typography.caption,
-    fontWeight: '700',
-  },
-  calendarHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: DS.spacing.sm,
-  },
-  calendarNav: {
-    width: 34,
-    height: 34,
-    borderRadius: DS.radius.pill,
-    borderWidth: 1,
-    borderColor: DS.colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: DS.colors.surface,
-  },
-  calendarNavText: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.subtitle,
-    fontWeight: '700',
-    lineHeight: DS.typography.subtitle,
-  },
-  calendarTitle: {
-    color: DS.colors.textPrimary,
-    fontSize: DS.typography.caption,
-    fontWeight: '700',
-  },
-  weekHeader: {
-    flexDirection: 'row',
-    marginBottom: DS.spacing.xs,
-  },
-  weekLabel: {
-    width: '14.28%',
-    textAlign: 'center',
+  chatExpandedHint: {
     color: DS.colors.textMuted,
     fontSize: DS.typography.micro,
-    fontWeight: '700',
+    marginBottom: DS.spacing.sm,
   },
-  calendarGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-  },
-  dayCell: {
-    width: '14.28%',
-    aspectRatio: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+  chatExitBtn: {
+    marginTop: DS.spacing.sm,
+    borderWidth: 1,
+    borderColor: DS.colors.border,
     borderRadius: DS.radius.sm,
-    marginBottom: 4,
+    alignItems: 'center',
+    paddingVertical: DS.spacing.sm,
+    backgroundColor: DS.colors.surface,
   },
-  dayCellHasData: {
-    backgroundColor: '#EEF6F4',
-  },
-  dayCellSelected: {
-    backgroundColor: DS.colors.brand,
-  },
-  dayText: {
-    color: DS.colors.textPrimary,
+  chatExitBtnText: {
+    color: DS.colors.textSecondary,
     fontSize: DS.typography.caption,
-    fontWeight: '600',
-  },
-  dayTextDisabled: {
-    color: '#BEC9CA',
-  },
-  dayTextSelected: {
-    color: DS.colors.surface,
-    fontWeight: '800',
+    fontWeight: '700',
   },
 });

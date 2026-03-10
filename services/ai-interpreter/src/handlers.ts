@@ -5,6 +5,7 @@ import { Pool } from 'pg';
 import OpenAI from 'openai';
 import {
   QUEUES,
+  type NotificationJob,
   getDefaultPrecheckProfile,
   resolvePrecheckProfile,
   type PrecheckCheckType,
@@ -23,7 +24,6 @@ import {
 import {
   evaluateDelegationCompletion,
   formatDelegationProgressUpdate,
-  formatDelegationCompletionUpdate,
 } from './delegation-completion-policy';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -90,6 +90,14 @@ function loadConsumerReliabilityOptions(): ConsumerReliabilityOptions {
 
 const CONSUMER_RELIABILITY = loadConsumerReliabilityOptions();
 const INCOMING_MESSAGES_CONSUMER = 'ai-interpreter.incoming-messages';
+type InboundChannel = 'APP' | 'WHATSAPP';
+type InboundChannelContext = {
+  channel: InboundChannel;
+  provider?: 'TWILIO_WHATSAPP';
+  fromEndpoint?: string;
+  toEndpoint?: string;
+  externalMessageId?: string;
+};
 
 function nowMs(): number {
   return Date.now();
@@ -589,6 +597,89 @@ Return:
   }
 }
 
+function compactText(value: string, limit = 220): string {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, Math.max(1, limit - 1))}...`;
+}
+
+function buildDeterministicCompletionSummary(input: {
+  clientName: string;
+  latestClientMessage: string;
+  conversationContext: string;
+}): string {
+  const latest = compactText(input.latestClientMessage, 220);
+  if (latest) {
+    return [
+      `Delegation update for ${input.clientName}: I gathered the key client logistics updates and noted them in Agent Desk.`,
+      `Most useful new information: "${latest}"`,
+    ].join('\n');
+  }
+  const contextLine = compactText(input.conversationContext.split('\n').slice(-1)[0] || '', 200);
+  if (contextLine) {
+    return [
+      `Delegation update for ${input.clientName}: I gathered the key client logistics updates and noted them in Agent Desk.`,
+      `Most useful new information: "${contextLine}"`,
+    ].join('\n');
+  }
+  return `Delegation update for ${input.clientName}: I gathered key logistics updates from this delegation and posted them in Agent Desk.`;
+}
+
+async function buildCaregiverDelegationCompletionSummaryWithLLM(input: {
+  clientName: string;
+  objective: string;
+  latestClientMessage: string;
+  conversationContext: string;
+  delegationType: 'FACT_CHECK' | 'LOGISTICS' | 'OPEN_ENDED';
+}): Promise<string> {
+  const fallback = buildDeterministicCompletionSummary({
+    clientName: input.clientName,
+    latestClientMessage: input.latestClientMessage,
+    conversationContext: input.conversationContext,
+  });
+  if (!process.env.OPENAI_API_KEY) {
+    return fallback;
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content: `You are writing an internal caregiver-facing completion update after a delegation.
+
+Write a natural-language summary focused on practical logistics and actionable updates from the client/family.
+Do not produce a question-by-question checklist.
+Do not mention model reasoning or confidence.
+Keep it concise: 2-4 short sentences, under 120 words.
+Start with "Delegation update for <client name>:".
+If details are thin, state that clearly and include the most useful detail available.`,
+        },
+        {
+          role: 'user',
+          content: [
+            `Client name: ${input.clientName}`,
+            `Delegation objective: ${compactText(input.objective, 260)}`,
+            `Delegation type: ${input.delegationType}`,
+            `Latest client message: ${compactText(input.latestClientMessage, 260) || '(none)'}`,
+            `Recent conversation lines:\n${input.conversationContext || '(none)'}`,
+          ].join('\n\n'),
+        },
+      ],
+    });
+    const text = String(completion.choices[0]?.message?.content || '').trim();
+    if (!text) return fallback;
+    return text;
+  } catch (error) {
+    console.error('[AI] Failed to generate natural-language delegation completion summary', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return fallback;
+  }
+}
+
 async function isSystemPrecheckActive(pool: Pool, appointmentId: string): Promise<boolean> {
   const res = await pool.query(
     `
@@ -797,12 +888,13 @@ export async function initializeConsumers(sqs: SQSClient, pool: Pool) {
     delegationCompletionNotifyV1: DELEGATION_COMPLETION_NOTIFY_V1,
     delegationProgressNotifyV1: DELEGATION_PROGRESS_NOTIFY_V1,
   });
-  const [chatQueueUrl, updatesQueueUrl] = await Promise.all([
+  const [chatQueueUrl, updatesQueueUrl, notificationQueueUrl] = await Promise.all([
     getQueueUrl(sqs, QUEUES.INCOMING_MESSAGES),
     getQueueUrl(sqs, QUEUES.READINESS_UPDATES),
+    getQueueUrl(sqs, QUEUES.NOTIFICATION),
   ]);
 
-  pollChatQueue(sqs, pool, chatQueueUrl, updatesQueueUrl).catch(err => {
+  pollChatQueue(sqs, pool, chatQueueUrl, updatesQueueUrl, notificationQueueUrl).catch(err => {
     console.error('[AI] Fatal Loop Error:', err);
   });
 }
@@ -815,7 +907,13 @@ async function getQueueUrl(sqs: SQSClient, queueName: string): Promise<string> {
   return response.QueueUrl;
 }
 
-async function pollChatQueue(sqs: SQSClient, pool: Pool, chatQueueUrl: string, updatesQueueUrl: string) {
+async function pollChatQueue(
+  sqs: SQSClient,
+  pool: Pool,
+  chatQueueUrl: string,
+  updatesQueueUrl: string,
+  notificationQueueUrl: string,
+) {
   while (true) {
     try {
       cleanupProcessedMessageCache(
@@ -885,7 +983,7 @@ async function pollChatQueue(sqs: SQSClient, pool: Pool, chatQueueUrl: string, u
           }
 
           try {
-            await processChatMessage(sqs, pool, msg, updatesQueueUrl);
+            await processChatMessage(sqs, pool, msg, updatesQueueUrl, notificationQueueUrl);
             await sqs.send(
               new DeleteMessageCommand({
                 QueueUrl: chatQueueUrl,
@@ -933,7 +1031,13 @@ async function pollChatQueue(sqs: SQSClient, pool: Pool, chatQueueUrl: string, u
 }
 
 // --- MAIN PROCESSOR ---
-async function processChatMessage(sqs: SQSClient, pool: Pool, msg: Message, updatesQueueUrl: string) {
+async function processChatMessage(
+  sqs: SQSClient,
+  pool: Pool,
+  msg: Message,
+  updatesQueueUrl: string,
+  notificationQueueUrl: string,
+) {
   if (!msg.Body) {
     throw new NonRetryableMessageError('Missing message body', 'MISSING_BODY');
   }
@@ -948,6 +1052,15 @@ async function processChatMessage(sqs: SQSClient, pool: Pool, msg: Message, upda
   const appointmentId = String(body.appointmentId || '').trim();
   const senderType = String(body.senderType || '').trim().toUpperCase();
   const messageId = body.messageId ? String(body.messageId) : undefined;
+  const channelRaw = String(body.channel || '').trim().toUpperCase();
+  const channel: InboundChannel = channelRaw === 'WHATSAPP' ? 'WHATSAPP' : 'APP';
+  const channelContext: InboundChannelContext = {
+    channel,
+    provider: channel === 'WHATSAPP' ? 'TWILIO_WHATSAPP' : undefined,
+    fromEndpoint: body.fromEndpoint ? String(body.fromEndpoint) : undefined,
+    toEndpoint: body.toEndpoint ? String(body.toEndpoint) : undefined,
+    externalMessageId: body.externalMessageId ? String(body.externalMessageId) : undefined,
+  };
 
   if (!appointmentId) {
     throw new NonRetryableMessageError('Incoming message missing appointmentId', 'MISSING_APPOINTMENT_ID');
@@ -977,7 +1090,7 @@ async function processChatMessage(sqs: SQSClient, pool: Pool, msg: Message, upda
   // --- JOB 2: Delegated conversation mode ---
   // Caregiver delegation controls whether AI can respond to non-caregiver participants.
   if (senderType === 'FAMILY' || senderType === 'COORDINATOR') {
-    await runCaregiverAgent(pool, text, appointmentId, readinessUpdates, messageId);
+    await runCaregiverAgent(sqs, pool, text, appointmentId, readinessUpdates, channelContext, notificationQueueUrl, messageId);
   }
 }
 
@@ -1080,12 +1193,59 @@ async function runReadinessAnalysis(
   return highConfidenceUpdates;
 }
 
+async function publishWhatsAppReplyNotification(input: {
+  sqs: SQSClient;
+  queueUrl: string;
+  appointmentId: string;
+  replyText: string;
+  replyMessageId: string;
+  fromEndpoint?: string;
+  toEndpoint?: string;
+  inboundExternalMessageId?: string;
+}): Promise<void> {
+  const targetEndpoint = String(input.toEndpoint || '').trim();
+  if (!targetEndpoint) {
+    console.warn('[AI] Skipping WhatsApp outbound notification without toEndpoint', {
+      appointmentId: input.appointmentId,
+      replyMessageId: input.replyMessageId,
+    });
+    return;
+  }
+
+  const notification: NotificationJob = {
+    type: 'WHATSAPP',
+    recipient: targetEndpoint,
+    templateId: 'WHATSAPP_AI_REPLY',
+    data: {
+      appointmentId: input.appointmentId,
+      replyText: input.replyText,
+      messageId: input.replyMessageId,
+    },
+    correlationId: input.replyMessageId || undefined,
+    provider: 'TWILIO_WHATSAPP',
+    fromEndpoint: input.fromEndpoint,
+    toEndpoint: targetEndpoint,
+    conversationRef: input.appointmentId,
+    externalMessageId: input.inboundExternalMessageId,
+  };
+
+  await input.sqs.send(
+    new SendMessageCommand({
+      QueueUrl: input.queueUrl,
+      MessageBody: JSON.stringify(notification),
+    }),
+  );
+}
+
 // --- SUB-ROUTINE 2: THE DIGITAL TWIN AGENT (New Logic) ---
 async function runCaregiverAgent(
+  sqs: SQSClient,
   pool: Pool,
   userText: string,
   appointmentId: string,
   readinessUpdates: ReadinessUpdate[],
+  channelContext: InboundChannelContext,
+  notificationQueueUrl: string,
   messageId?: string,
 ) {
   console.log(`[AI] 🤖 Checking if Caregiver Agent should reply...`);
@@ -1304,10 +1464,28 @@ async function runCaregiverAgent(
       );
 
   // 4. INSERT REPLY INTO DB
-  await pool.query(`
-    INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
-    VALUES ($1, 'AI_AGENT', $2, $3, true)
-  `, [appointmentId, caregiverId, replyText]);
+  const replyInsert = await pool.query(
+    `
+      INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent, channel)
+      VALUES ($1, 'AI_AGENT', $2, $3, true, $4)
+      RETURNING id::text AS id
+    `,
+    [appointmentId, caregiverId, replyText, channelContext.channel],
+  );
+  const replyMessageId = String(replyInsert.rows[0]?.id || '').trim();
+
+  if (channelContext.channel === 'WHATSAPP') {
+    await publishWhatsAppReplyNotification({
+      sqs,
+      queueUrl: notificationQueueUrl,
+      appointmentId,
+      replyText,
+      replyMessageId,
+      fromEndpoint: channelContext.toEndpoint,
+      toEndpoint: channelContext.fromEndpoint,
+      inboundExternalMessageId: channelContext.externalMessageId,
+    });
+  }
 
   // Persist delegation question progress so we do not keep asking repeats.
   const askedIndexThisTurn =
@@ -1384,12 +1562,12 @@ async function runCaregiverAgent(
   }
 
   if (completionReady) {
-    const completionMessage = formatDelegationCompletionUpdate({
+    const completionMessage = await buildCaregiverDelegationCompletionSummaryWithLLM({
       clientName,
-      questions,
-      resolvedIndexes: resolvedIndexList,
-      unresolvedRequiredIndexes: unresolvedRequiredIndexList,
+      objective,
       latestClientMessage: userText,
+      conversationContext,
+      delegationType,
     });
     const dedupeKey = buildDelegationCompletionDedupeKey({
       appointmentId,

@@ -291,6 +291,7 @@ async function main() {
 
   // --- 3. SERVER & CORS (THE FIX) ---
   const app = express();
+  app.set('trust proxy', true);
 
   // A. The Package
   app.use(cors());
@@ -299,11 +300,15 @@ async function main() {
   app.use((req, res, next) => {
     console.log(`[REQUEST] ${req.method} ${req.url}`); // Log every hit!
     res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Twilio-Signature",
+    );
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     next();
   });
 
+  app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
   const sessions = new Map<string, SessionUser>();
 
@@ -356,6 +361,120 @@ async function main() {
     if (role === 'FAMILY') return 'FAMILY';
     if (role === 'COORDINATOR') return 'COORDINATOR';
     return 'CAREGIVER';
+  }
+
+  function normalizeWhatsAppEndpoint(value: unknown): string {
+    let raw = String(value || '').trim();
+    if (!raw) return '';
+    if (raw.toLowerCase().startsWith('whatsapp:')) {
+      raw = raw.slice('whatsapp:'.length).trim();
+    }
+    raw = raw.replace(/[\s()-]/g, '');
+    if (/^\d+$/.test(raw)) {
+      raw = `+${raw}`;
+    }
+    if (!/^\+\d{7,15}$/.test(raw)) return '';
+    return raw;
+  }
+
+  function buildFullRequestUrl(req: Request): string {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0]?.trim();
+    const protocol = forwardedProto || req.protocol || 'http';
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0]?.trim();
+    return `${protocol}://${host}${req.originalUrl}`;
+  }
+
+  function computeTwilioSignature(
+    authToken: string,
+    url: string,
+    params: Record<string, string>,
+  ): string {
+    const sortedKeys = Object.keys(params).sort();
+    const payload = sortedKeys.reduce((acc, key) => `${acc}${key}${params[key]}`, url);
+    return crypto.createHmac('sha1', authToken).update(payload).digest('base64');
+  }
+
+  function isValidTwilioSignature(req: Request): boolean {
+    if (!config.whatsapp.twilioAuthToken) return false;
+    const expectedHeader = String(req.header('X-Twilio-Signature') || '').trim();
+    if (!expectedHeader) return false;
+
+    const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+    const normalized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (value === undefined || value === null) continue;
+      normalized[key] = Array.isArray(value)
+        ? value.map((item) => String(item ?? '')).join('')
+        : String(value);
+    }
+
+    const requestUrl = buildFullRequestUrl(req);
+    const computed = computeTwilioSignature(config.whatsapp.twilioAuthToken, requestUrl, normalized);
+    const left = Buffer.from(computed);
+    const right = Buffer.from(expectedHeader);
+    if (left.length !== right.length) return false;
+    return crypto.timingSafeEqual(left, right);
+  }
+
+  function sendTwilioXmlAck(res: Response): void {
+    res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  }
+
+  function isWhatsAppAllowlisted(endpoint: string): boolean {
+    if (!config.whatsapp.trialMode) return true;
+    if (config.whatsapp.allowlistNumbers.length === 0) return true;
+    const allowlist = new Set(config.whatsapp.allowlistNumbers.map((item) => normalizeWhatsAppEndpoint(item)).filter(Boolean));
+    return allowlist.has(endpoint);
+  }
+
+  async function resolveClientIdByWhatsAppEndpoint(endpoint: string): Promise<string | null> {
+    const result = await pool.query(
+      `
+        SELECT entity_id::text AS entity_id
+        FROM channel_endpoints
+        WHERE provider = 'twilio_whatsapp'
+          AND endpoint = $1
+          AND entity_type = 'CLIENT'
+          AND active = true
+        ORDER BY verified DESC, updated_at DESC
+        LIMIT 1
+      `,
+      [endpoint],
+    );
+    return result.rows[0]?.entity_id ? String(result.rows[0].entity_id) : null;
+  }
+
+  async function resolveOperationalAppointmentForClient(clientId: string): Promise<AppointmentScopeRow | null> {
+    const result = await pool.query(
+      `
+        SELECT
+          id::text AS appointment_id,
+          caregiver_id::text AS caregiver_id,
+          client_id::text AS client_id,
+          start_time::text AS start_time
+        FROM appointments
+        WHERE client_id = $1::uuid
+          AND caregiver_id IS NOT NULL
+          AND COALESCE(aloha_status, 'SCHEDULED') IN ('SCHEDULED', 'IN_PROGRESS', 'COMPLETED')
+        ORDER BY
+          CASE
+            WHEN start_time BETWEEN NOW() - INTERVAL '1 day' AND NOW() + INTERVAL '7 days' THEN 0
+            ELSE 1
+          END,
+          CASE WHEN start_time >= NOW() THEN 0 ELSE 1 END,
+          ABS(EXTRACT(EPOCH FROM (start_time - NOW()))) ASC
+        LIMIT 1
+      `,
+      [clientId],
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return {
+      appointmentId: String(row.appointment_id || ''),
+      caregiverId: String(row.caregiver_id || ''),
+      clientId: String(row.client_id || ''),
+      startTime: String(row.start_time || ''),
+    };
   }
 
   function authorizeAgentUserAccess(req: Request, res: Response, requestedUserId: string): SessionUser | null {
@@ -3414,6 +3533,96 @@ Return:
     res.json({ data: READINESS_CHECKS });
   });
 
+  // POST /testing/channel-endpoints/upsert
+  // Local demo helper to map WhatsApp endpoints to known entities.
+  app.post('/testing/channel-endpoints/upsert', async (req: Request, res: Response) => {
+    try {
+      const provider = String(req.body?.provider || 'twilio_whatsapp').trim().toLowerCase();
+      const endpoint = normalizeWhatsAppEndpoint(req.body?.endpoint);
+      const entityType = String(req.body?.entityType || '').trim().toUpperCase();
+      const entityId = String(req.body?.entityId || '').trim();
+      const verified = Boolean(req.body?.verified);
+      const active = req.body?.active === undefined ? true : Boolean(req.body?.active);
+
+      if (provider !== 'twilio_whatsapp') {
+        return res.status(400).json({ error: 'provider must be twilio_whatsapp' });
+      }
+      if (!endpoint) {
+        return res.status(400).json({ error: 'Valid endpoint is required (E.164 phone)' });
+      }
+      if (!entityId) {
+        return res.status(400).json({ error: 'entityId is required' });
+      }
+      if (!['CLIENT', 'CAREGIVER', 'COORDINATOR'].includes(entityType)) {
+        return res.status(400).json({ error: 'entityType must be CLIENT, CAREGIVER, or COORDINATOR' });
+      }
+
+      const result = await pool.query(
+        `
+          INSERT INTO channel_endpoints (
+            provider,
+            endpoint,
+            entity_type,
+            entity_id,
+            active,
+            verified,
+            metadata,
+            updated_at
+          )
+          VALUES ($1, $2, $3, $4::uuid, $5, $6, '{}'::jsonb, NOW())
+          ON CONFLICT (provider, endpoint, entity_type, entity_id)
+          DO UPDATE SET
+            active = EXCLUDED.active,
+            verified = EXCLUDED.verified,
+            updated_at = NOW()
+          RETURNING
+            id::text AS id,
+            provider,
+            endpoint,
+            entity_type AS "entityType",
+            entity_id::text AS "entityId",
+            active,
+            verified,
+            created_at AS "createdAt",
+            updated_at AS "updatedAt"
+        `,
+        [provider, endpoint, entityType, entityId, active, verified],
+      );
+
+      res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+      console.error('Failed to upsert channel endpoint', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  app.get('/testing/channel-endpoints', async (_req: Request, res: Response) => {
+    try {
+      const result = await pool.query(
+        `
+          SELECT
+            id::text AS id,
+            provider,
+            endpoint,
+            entity_type AS "entityType",
+            entity_id::text AS "entityId",
+            active,
+            verified,
+            last_seen_at AS "lastSeenAt",
+            created_at AS "createdAt",
+            updated_at AS "updatedAt"
+          FROM channel_endpoints
+          ORDER BY updated_at DESC
+          LIMIT 200
+        `,
+      );
+      res.json({ success: true, data: result.rows });
+    } catch (error) {
+      console.error('Failed to list channel endpoints', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
   app.get('/auth/accounts', async (req: Request, res: Response) => {
     try {
       const role = String(req.query.role || '').toUpperCase();
@@ -4205,6 +4414,231 @@ Return:
     }
   });
 
+  // POST /webhooks/twilio/whatsapp/inbound
+  // Twilio WhatsApp inbound webhook for trial/sandbox demo traffic.
+  app.post('/webhooks/twilio/whatsapp/inbound', async (req: Request, res: Response) => {
+    try {
+      if (!config.whatsapp.enabled) {
+        return res.status(503).json({ error: 'WhatsApp integration is disabled' });
+      }
+
+      if (!isValidTwilioSignature(req)) {
+        return res.status(401).json({ error: 'Invalid Twilio signature' });
+      }
+
+      const messageSid = String(req.body?.MessageSid || '').trim();
+      const fromRaw = String(req.body?.From || '').trim();
+      const toRaw = String(req.body?.To || '').trim();
+      const bodyText = String(req.body?.Body || '').trim();
+      const numMedia = Math.max(0, Math.trunc(Number(req.body?.NumMedia || '0')));
+      if (!messageSid) {
+        return res.status(400).json({ error: 'MessageSid is required' });
+      }
+
+      const dedupeInsert = await pool.query(
+        `
+          INSERT INTO webhook_inbox_events (
+            provider,
+            provider_message_id,
+            event_type,
+            status,
+            payload
+          )
+          VALUES ($1, $2, 'INBOUND', 'RECEIVED', $3::jsonb)
+          ON CONFLICT (provider, provider_message_id) DO NOTHING
+          RETURNING id
+        `,
+        ['twilio_whatsapp', messageSid, JSON.stringify(req.body || {})],
+      );
+      if (dedupeInsert.rows.length === 0) {
+        return sendTwilioXmlAck(res);
+      }
+
+      const fromEndpoint = normalizeWhatsAppEndpoint(fromRaw);
+      const toEndpoint = normalizeWhatsAppEndpoint(toRaw);
+      if (!fromEndpoint) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_INVALID_FROM', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      if (!isWhatsAppAllowlisted(fromEndpoint)) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_NOT_ALLOWLISTED', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      if (numMedia > 0) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_UNSUPPORTED_MEDIA', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      if (!bodyText) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_EMPTY_BODY', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      const mappedClientId = await resolveClientIdByWhatsAppEndpoint(fromEndpoint);
+      if (!mappedClientId) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_UNMAPPED_ENDPOINT', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      await pool.query(
+        `
+          UPDATE channel_endpoints
+          SET last_seen_at = NOW(), updated_at = NOW()
+          WHERE provider = 'twilio_whatsapp'
+            AND endpoint = $1
+            AND entity_type = 'CLIENT'
+            AND entity_id = $2::uuid
+        `,
+        [fromEndpoint, mappedClientId],
+      );
+
+      const appointmentScope = await resolveOperationalAppointmentForClient(mappedClientId);
+      if (!appointmentScope?.appointmentId) {
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'IGNORED_NO_APPOINTMENT_CONTEXT', processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid],
+        );
+        return sendTwilioXmlAck(res);
+      }
+
+      const messageInsert = await pool.query(
+        `
+          INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent, channel)
+          VALUES ($1::uuid, 'FAMILY', $2, $3, false, 'WHATSAPP')
+          RETURNING id, created_at
+        `,
+        [appointmentScope.appointmentId, mappedClientId, bodyText],
+      );
+      const newMessage = messageInsert.rows[0];
+
+      await publishMessage(sqsClient, QUEUES.INCOMING_MESSAGES, {
+        type: 'NEW_MESSAGE',
+        appointmentId: appointmentScope.appointmentId,
+        text: bodyText,
+        senderType: 'FAMILY',
+        senderId: mappedClientId,
+        messageId: newMessage.id,
+        channel: 'WHATSAPP',
+        provider: 'TWILIO_WHATSAPP',
+        fromEndpoint,
+        toEndpoint,
+        externalMessageId: messageSid,
+      });
+
+      await pool.query(
+        `
+          UPDATE webhook_inbox_events
+          SET status = 'PROCESSED',
+              payload = payload || $3::jsonb,
+              processed_at = NOW()
+          WHERE provider = $1 AND provider_message_id = $2
+        `,
+        [
+          'twilio_whatsapp',
+          messageSid,
+          JSON.stringify({
+            appointmentId: appointmentScope.appointmentId,
+            messageId: newMessage.id,
+            fromEndpoint,
+            toEndpoint,
+          }),
+        ],
+      );
+
+      return sendTwilioXmlAck(res);
+    } catch (error) {
+      console.error('Failed Twilio WhatsApp inbound webhook', error);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // POST /webhooks/twilio/whatsapp/status
+  // Twilio WhatsApp delivery status callback.
+  app.post('/webhooks/twilio/whatsapp/status', async (req: Request, res: Response) => {
+    try {
+      if (!config.whatsapp.enabled) {
+        return res.status(503).json({ error: 'WhatsApp integration is disabled' });
+      }
+
+      if (!isValidTwilioSignature(req)) {
+        return res.status(401).json({ error: 'Invalid Twilio signature' });
+      }
+
+      const messageSid = String(req.body?.MessageSid || '').trim();
+      const messageStatus = String(req.body?.MessageStatus || req.body?.SmsStatus || '').trim().toUpperCase();
+      if (!messageSid) {
+        return res.status(400).json({ error: 'MessageSid is required' });
+      }
+
+      await pool.query(
+        `
+          INSERT INTO webhook_inbox_events (
+            provider,
+            provider_message_id,
+            event_type,
+            status,
+            payload,
+            processed_at
+          )
+          VALUES ($1, $2, 'STATUS', $3, $4::jsonb, NOW())
+          ON CONFLICT (provider, provider_message_id)
+          DO UPDATE SET
+            status = EXCLUDED.status,
+            event_type = EXCLUDED.event_type,
+            payload = webhook_inbox_events.payload || EXCLUDED.payload,
+            processed_at = NOW()
+        `,
+        ['twilio_whatsapp_outbound', messageSid, messageStatus || 'UNKNOWN', JSON.stringify(req.body || {})],
+      );
+
+      return sendTwilioXmlAck(res);
+    } catch (error) {
+      console.error('Failed Twilio WhatsApp status webhook', error);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
   // POST /messages
   app.post('/messages', async (req: Request, res: Response) => {
     try {
@@ -4244,7 +4678,8 @@ Return:
         text: content,
         senderType: finalSenderType,
         senderId: finalSenderId,
-        messageId: newMessage.id
+        messageId: newMessage.id,
+        channel: 'APP',
       });
 
       res.json({ success: true, data: newMessage });

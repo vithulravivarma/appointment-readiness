@@ -2,6 +2,8 @@
 
 This document explains every current AI/agentic workflow in this repository, with step-by-step execution paths and debugging guidance.
 
+UI note: Agent Desk delegation start is now chat-driven only in `mobile-app/app/agent-command-center.tsx` (the old manual objective/questions form was removed from the screen). Backend delegation start logic and APIs still exist.
+
 ## Scope
 
 This covers all active AI/agentic behavior as of March 2026:
@@ -12,6 +14,28 @@ This covers all active AI/agentic behavior as of March 2026:
 4. Agent state persistence, dedupe/idempotency, and message history paths used by those flows.
 
 It does not cover speculative/planned tools in docs unless they are wired in code.
+
+## Twilio Sandbox 5-Minute Pre-Demo Checklist
+
+Run this right before demo time:
+
+1. Sandbox join:
+- From each demo phone, send the Twilio Sandbox join phrase to the Twilio sandbox WhatsApp number.
+- Confirm each phone receives the "joined sandbox" confirmation reply.
+2. Webhook health:
+- Ensure your tunnel URL is live.
+- Twilio inbound webhook: `POST /webhooks/twilio/whatsapp/inbound`.
+- Twilio status webhook: `POST /webhooks/twilio/whatsapp/status`.
+3. Service health:
+- Confirm `appointment-management-service`, `ai-interpreter`, and `notification-service` are healthy.
+4. Env sanity:
+- `WHATSAPP_ENABLED=true`
+- `WHATSAPP_TRIAL_MODE=true`
+- `TWILIO_ACCOUNT_SID`, `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` are loaded.
+5. End-to-end probe:
+- Send one WhatsApp text from a joined/allowlisted phone.
+- Verify inbound row in `messages` has `channel='WHATSAPP'`.
+- Verify AI reply is delivered back to WhatsApp.
 
 ## Source Map
 
@@ -204,6 +228,11 @@ Contact confirmation prompt:
 - records asked question indexes.
 5. Returns `mode=DELEGATION_STARTED`.
 
+Operational note:
+
+- Caregiver-facing Agent Desk now initiates delegation through `/agents/:userId/command` (tool route), not a dedicated manual form.
+- Backend endpoint support remains for delegation lifecycle management (`/agents/:userId/delegations/:appointmentId/stop`, summaries, state persistence).
+
 Critical checks enforced before normal delegation start:
 
 - `ACCESS_CONFIRMED`
@@ -311,6 +340,10 @@ If delegation is active and caregiver-managed:
 - `progressNotifiedIndexes`
 - `completionNotifiedAt`
 
+Completion message format:
+
+- Completion updates written to Agent Desk are generated as natural-language caregiver summaries (LLM-first with deterministic fallback), not a rigid question-by-question answer checklist.
+
 Important: completion notification does not auto-stop manual delegation.
 
 ### B8) Precheck completion path
@@ -355,6 +388,39 @@ Finds next eligible scheduled appointment per client where:
 5. Seeds `PRECHECK_PLANNER` event.
 
 This means precheck is represented using the same delegation structure as manual delegation, but marked system-managed.
+
+## Workflow D: Twilio WhatsApp Sandbox (Demo Path)
+
+Entrypoints in `appointment-management-service`:
+
+- `POST /webhooks/twilio/whatsapp/inbound`
+- `POST /webhooks/twilio/whatsapp/status`
+
+### D1) Inbound webhook handling
+
+1. Verifies Twilio signature from `X-Twilio-Signature`.
+2. Uses `webhook_inbox_events` for idempotency on `(provider, provider_message_id)`.
+3. Normalizes `From`/`To` WhatsApp endpoints to E.164 format.
+4. Enforces trial allowlist when `WHATSAPP_TRIAL_MODE=true`.
+5. Rejects media for demo mode (`NumMedia > 0`).
+6. Resolves sender endpoint via `channel_endpoints` (`provider='twilio_whatsapp', entity_type='CLIENT'`).
+7. Resolves operational appointment context for that client.
+8. Writes inbound chat row to `messages` with `sender_type='FAMILY'` and `channel='WHATSAPP'`.
+9. Publishes enriched `NEW_MESSAGE` event to `incoming-messages-queue` with `channel/provider/fromEndpoint/toEndpoint/externalMessageId`.
+
+### D2) AI interpreter propagation
+
+1. `ai-interpreter` parses optional channel/provider metadata from incoming events.
+2. Existing readiness + delegation logic remains unchanged.
+3. AI reply row is written to `messages` with the same channel (`APP` or `WHATSAPP`).
+4. If channel is `WHATSAPP`, interpreter publishes a `NotificationJob` with `type='WHATSAPP'` to `notification-queue`.
+
+### D3) Outbound WhatsApp delivery
+
+1. `notification-service` handles `NotificationJob.type='WHATSAPP'`.
+2. Sends via Twilio Messages API (`from=TWILIO_WHATSAPP_FROM`, `to=whatsapp:+E164`, `Body=<reply text>`).
+3. Stores outbound provider metadata in `webhook_inbox_events` with provider `twilio_whatsapp_outbound`.
+4. Twilio status callbacks update outbound status through `POST /webhooks/twilio/whatsapp/status`.
 
 ## Chat Dissection Examples
 
@@ -519,6 +585,14 @@ Look for:
 Query `message_idempotency` by `consumer_name` and recent `processed_at`.
 
 This confirms whether events were dropped as duplicates/non-retryable.
+
+### 7) Use precheck reset/debug endpoints
+
+Useful when precheck appears stuck or you need a clean replay:
+
+- `GET /precheck/debug-candidates` to see currently kickoff-eligible appointments.
+- `POST /appointments/:id/precheck/reset` to clear precheck markers/messages for one appointment and requeue readiness evaluation.
+- `POST /precheck/reset-all` to clear global markers/messages and requeue eligible appointments.
 
 ## Known Design Behaviors (Important for Debugging)
 

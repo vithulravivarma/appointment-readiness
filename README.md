@@ -42,6 +42,14 @@ AWS_SECRET_ACCESS_KEY=test
 SQS_ENDPOINT=http://localhost:4566
 OPENAI_API_KEY=...
 GOOGLE_MAPS_API_KEY=...
+WHATSAPP_ENABLED=true
+WHATSAPP_TRIAL_MODE=true
+TWILIO_ACCOUNT_SID=...
+TWILIO_API_KEY_SID=...
+TWILIO_API_KEY_SECRET=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+WHATSAPP_ALLOWLIST_NUMBERS=+15551234567,+15557654321
 ```
 
 ## Install
@@ -96,6 +104,37 @@ curl http://localhost:3004/health
 curl http://localhost:3005/health
 curl http://localhost:3006/health
 ```
+
+## Twilio WhatsApp Sandbox Setup (Demo)
+
+1) Configure Twilio sandbox webhooks:
+- Inbound webhook: `POST http://<public-tunnel-host>/webhooks/twilio/whatsapp/inbound`
+- Status webhook: `POST http://<public-tunnel-host>/webhooks/twilio/whatsapp/status`
+
+2) Join Twilio WhatsApp sandbox from each demo phone:
+- Send the sandbox join code from each test phone to Twilio's sandbox WhatsApp number.
+
+3) Seed endpoint mapping for inbound resolution:
+```bash
+curl -X POST http://localhost:3001/testing/channel-endpoints/upsert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider":"twilio_whatsapp",
+    "endpoint":"+15551234567",
+    "entityType":"CLIENT",
+    "entityId":"<client-uuid>",
+    "verified":true
+  }'
+```
+
+4) Check endpoint mappings:
+```bash
+curl http://localhost:3001/testing/channel-endpoints
+```
+
+Notes:
+- Trial mode allowlist enforcement applies to inbound and outbound WhatsApp numbers.
+- Media messages are ignored in demo mode (text-only).
 
 ## Data Ingestion
 
