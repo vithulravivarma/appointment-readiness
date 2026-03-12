@@ -183,7 +183,62 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_desk_messages_dedupe_key
     ON agent_desk_messages(dedupe_key)
     WHERE dedupe_key IS NOT NULL;
 
--- 14. CHANNEL ENDPOINTS (Demo mapping for external transport endpoints)
+-- 14. SCHEDULER THREADS (Caregiver-scoped scheduler workspace)
+CREATE TABLE IF NOT EXISTS scheduler_threads (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    caregiver_id VARCHAR(255) NOT NULL UNIQUE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 15. ESCALATIONS (Tracked intervention items across Agent Desk/delegations/precheck)
+CREATE TABLE IF NOT EXISTS escalations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    caregiver_id VARCHAR(255) NOT NULL,
+    appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+    delegation_id VARCHAR(255),
+    source VARCHAR(80) NOT NULL,
+    category VARCHAR(80) NOT NULL,
+    priority VARCHAR(20) NOT NULL DEFAULT 'HIGH',
+    status VARCHAR(40) NOT NULL DEFAULT 'OPEN',
+    summary TEXT NOT NULL,
+    context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    opened_by VARCHAR(40) NOT NULL,
+    resolved_by VARCHAR(40),
+    resolution_type VARCHAR(80),
+    opened_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    acknowledged_at TIMESTAMP WITH TIME ZONE,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_escalations_caregiver_status_opened_desc
+    ON escalations(caregiver_id, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_escalations_appointment_status_opened_desc
+    ON escalations(appointment_id, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_escalations_status_opened_desc
+    ON escalations(status, opened_at DESC);
+
+-- 16. SCHEDULER THREAD MESSAGES (Caregiver<->Scheduler plus system escalation notices)
+CREATE TABLE IF NOT EXISTS scheduler_thread_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    thread_id UUID NOT NULL REFERENCES scheduler_threads(id) ON DELETE CASCADE,
+    sender_type VARCHAR(20) NOT NULL CHECK (sender_type IN ('CAREGIVER', 'COORDINATOR', 'SYSTEM', 'AI_AGENT')),
+    sender_id VARCHAR(255),
+    content TEXT NOT NULL,
+    escalation_id UUID REFERENCES escalations(id) ON DELETE SET NULL,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_thread_messages_thread_created_desc
+    ON scheduler_thread_messages(thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduler_thread_messages_escalation_created_desc
+    ON scheduler_thread_messages(escalation_id, created_at DESC);
+
+-- 17. CHANNEL ENDPOINTS (Demo mapping for external transport endpoints)
 CREATE TABLE IF NOT EXISTS channel_endpoints (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     provider VARCHAR(80) NOT NULL,
@@ -202,7 +257,7 @@ CREATE TABLE IF NOT EXISTS channel_endpoints (
 CREATE INDEX IF NOT EXISTS idx_channel_endpoints_provider_endpoint
     ON channel_endpoints(provider, endpoint);
 
--- 15. WEBHOOK INBOX EVENTS (Inbound idempotency + status tracking)
+-- 18. WEBHOOK INBOX EVENTS (Inbound idempotency + status tracking)
 CREATE TABLE IF NOT EXISTS webhook_inbox_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     provider VARCHAR(80) NOT NULL,
@@ -218,3 +273,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_inbox_events_provider_message
     ON webhook_inbox_events(provider, provider_message_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_inbox_events_created_desc
     ON webhook_inbox_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_inbox_events_provider_created_desc
+    ON webhook_inbox_events(provider, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_inbox_events_provider_status_created_desc
+    ON webhook_inbox_events(provider, status, created_at DESC);

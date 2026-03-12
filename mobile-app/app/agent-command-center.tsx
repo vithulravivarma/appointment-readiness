@@ -11,7 +11,7 @@ import {
   ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import axios from 'axios';
 import { API_BASE_URL } from '../constants/Config';
 import { DS, baseStyles } from '../design/system';
@@ -85,6 +85,7 @@ type AgentDeskHistoryRow = {
 
 export default function AgentCommandCenter() {
   const params = useLocalSearchParams();
+  const router = useRouter();
   const userId = String(params.userId || '00000000-0000-0000-0000-000000000002');
   const authToken = String(params.authToken || '');
   const authHeaders = authToken ? { Authorization: `Bearer ${authToken}` } : undefined;
@@ -587,9 +588,22 @@ export default function AgentCommandCenter() {
           <Text style={styles.panelTitle}>Caregiver Chat</Text>
           <Text style={styles.commandContextText}>Start delegation by asking in chat. Example: “Please contact family and ask about access updates.”</Text>
         </View>
-        <TouchableOpacity style={styles.chatExpandBtn} onPress={() => setChatExpanded(true)}>
-          <Text style={styles.chatExpandBtnText}>Open Fullscreen</Text>
-        </TouchableOpacity>
+        <View style={styles.chatHeaderActions}>
+          <TouchableOpacity
+            style={styles.chatSupportBtn}
+            onPress={() =>
+              router.push({
+                pathname: '/scheduler-support',
+                params: { role: 'CAREGIVER', userId, authToken },
+              })
+            }
+          >
+            <Text style={styles.chatSupportBtnText}>Scheduler Support</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.chatExpandBtn} onPress={() => setChatExpanded(true)}>
+            <Text style={styles.chatExpandBtnText}>Open Fullscreen</Text>
+          </TouchableOpacity>
+        </View>
       </View>
       {renderChatThread()}
       {renderChatComposer()}
@@ -1167,10 +1181,29 @@ const styles = StyleSheet.create({
   chatHeaderTextWrap: {
     flex: 1,
   },
+  chatHeaderActions: {
+    alignItems: 'flex-end',
+    gap: DS.spacing.xs,
+  },
   commandContextText: {
     color: DS.colors.textSecondary,
     fontSize: DS.typography.caption,
     lineHeight: 18,
+  },
+  chatSupportBtn: {
+    borderWidth: 1,
+    borderColor: '#BFD3F0',
+    borderRadius: DS.radius.pill,
+    paddingHorizontal: DS.spacing.sm,
+    paddingVertical: 6,
+    backgroundColor: '#EEF3FC',
+    minHeight: 36,
+    justifyContent: 'center',
+  },
+  chatSupportBtnText: {
+    color: '#1E4F9A',
+    fontSize: DS.typography.caption,
+    fontWeight: '700',
   },
   chatExpandBtn: {
     borderWidth: 1,

@@ -20,6 +20,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 const ROLE_FILTERS = [
   { label: 'Caregivers', value: 'CAREGIVER' },
   { label: 'Patients', value: 'FAMILY' },
+  { label: 'Schedulers', value: 'COORDINATOR' },
 ];
 
 export default function LoginScreen() {
@@ -81,7 +82,7 @@ export default function LoginScreen() {
       });
 
       const { token, user } = response.data;
-      const destination = user.role === 'COORDINATOR' ? '/appointment-list' : '/dashboard';
+      const destination = user.role === 'COORDINATOR' ? '/scheduler-desk' : '/dashboard';
 
       router.push({
         pathname: destination,
@@ -95,6 +96,34 @@ export default function LoginScreen() {
       });
     } catch (e) {
       setError('Login failed. Verify password (default is demo123).');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleOpenScheduler = async () => {
+    try {
+      setSubmitting(true);
+      setError('');
+
+      const response = await axios.post(`${API_BASE_URL}/auth/login`, {
+        username: 'scheduler-local',
+        password: 'demo123',
+      });
+
+      const { token, user } = response.data;
+      router.push({
+        pathname: '/scheduler-desk',
+        params: {
+          userId: user.userId,
+          name: user.name,
+          role: user.role,
+          authToken: token,
+          username: user.username,
+        },
+      });
+    } catch (e) {
+      setError('Could not open scheduler view. Ensure appointment-management-service is running.');
     } finally {
       setSubmitting(false);
     }
@@ -184,19 +213,10 @@ export default function LoginScreen() {
 
           <TouchableOpacity
             style={styles.schedulerCard}
-            onPress={() =>
-              router.push({
-                pathname: '/appointment-list',
-                params: {
-                  userId: 'scheduler-local',
-                  name: 'Scheduler',
-                  role: 'COORDINATOR',
-                },
-              })
-            }
+            onPress={handleOpenScheduler}
           >
             <Text style={styles.schedulerTitle}>Open Scheduler View</Text>
-            <Text style={styles.schedulerText}>Fallback route for coordinator testing without account provisioning.</Text>
+            <Text style={styles.schedulerText}>Local coordinator sign-in for scheduler escalation workflows.</Text>
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>

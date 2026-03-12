@@ -46,20 +46,37 @@ export default function Dashboard() {
         </View>
 
         {params.role === 'CAREGIVER' && (
-          <TouchableOpacity
-            style={styles.agentDeskButton}
-            onPress={() => {
-              router.push({
-                pathname: '/agent-command-center',
-                params: { ...params },
-              });
-            }}
-          >
-            <Text style={styles.agentDeskTitle}>Agent Desk</Text>
-            <Text style={styles.agentDeskMeta}>
-              Delegate conversations, assign goals, and review AI summaries when you return.
-            </Text>
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity
+              style={styles.agentDeskButton}
+              onPress={() => {
+                router.push({
+                  pathname: '/agent-command-center',
+                  params: { ...params },
+                });
+              }}
+            >
+              <Text style={styles.agentDeskTitle}>Agent Desk</Text>
+              <Text style={styles.agentDeskMeta}>
+                Delegate conversations, assign goals, and review AI summaries when you return.
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.schedulerSupportButton}
+              onPress={() => {
+                router.push({
+                  pathname: '/scheduler-support',
+                  params: { ...params },
+                });
+              }}
+            >
+              <Text style={styles.schedulerSupportTitle}>Scheduler Support</Text>
+              <Text style={styles.schedulerSupportMeta}>
+                Message scheduler directly and track escalation updates in one thread.
+              </Text>
+            </TouchableOpacity>
+          </>
         )}
       </ScrollView>
     </SafeAreaView>
@@ -165,6 +182,24 @@ const styles = StyleSheet.create({
     marginBottom: DS.spacing.xxs,
   },
   agentDeskMeta: {
+    color: DS.colors.textSecondary,
+    fontSize: DS.typography.caption,
+    lineHeight: 18,
+  },
+  schedulerSupportButton: {
+    ...baseStyles.card,
+    marginTop: DS.spacing.sm,
+    padding: DS.spacing.md,
+    backgroundColor: '#F2F6FC',
+    borderColor: '#C9D8F4',
+  },
+  schedulerSupportTitle: {
+    color: '#1E4F9A',
+    fontSize: DS.typography.subtitle,
+    fontWeight: '800',
+    marginBottom: DS.spacing.xxs,
+  },
+  schedulerSupportMeta: {
     color: DS.colors.textSecondary,
     fontSize: DS.typography.caption,
     lineHeight: 18,

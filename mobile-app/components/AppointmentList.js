@@ -32,6 +32,7 @@ export default function AppointmentList({ role, userId, authToken }) {
   });
 
   const router = useRouter();
+  const isChatUser = role === 'CAREGIVER' || role === 'FAMILY';
 
   useEffect(() => {
     fetchAppointments();
@@ -72,6 +73,36 @@ export default function AppointmentList({ role, userId, authToken }) {
     [filteredAppointments],
   );
 
+  const conversationGroups = useMemo(() => {
+    if (!isChatUser) return [];
+    const byClient = new Map();
+    for (const appointment of filteredAppointments) {
+      const key = String(appointment.client_id || `name:${appointment.client_name || 'unknown'}`);
+      if (!byClient.has(key)) {
+        byClient.set(key, []);
+      }
+      byClient.get(key).push(appointment);
+    }
+
+    const groups = Array.from(byClient.entries()).map(([key, entries]) => {
+      const sorted = [...entries].sort((a, b) => new Date(b.start_time || '').getTime() - new Date(a.start_time || '').getTime());
+      const activeAppointment = pickConversationAppointment(sorted);
+      return {
+        key,
+        clientId: sorted[0]?.client_id || '',
+        clientName: sorted[0]?.client_name || 'Unknown client',
+        appointments: sorted,
+        activeAppointment,
+      };
+    });
+
+    return groups.sort((a, b) => {
+      const left = new Date(a.activeAppointment?.start_time || '').getTime();
+      const right = new Date(b.activeAppointment?.start_time || '').getTime();
+      return right - left;
+    });
+  }, [filteredAppointments, isChatUser]);
+
   useEffect(() => {
     if (dateFilter) {
       setShowLaterAppointments(true);
@@ -111,28 +142,11 @@ export default function AppointmentList({ role, userId, authToken }) {
     );
   }
 
-  const isChatUser = role === 'CAREGIVER' || role === 'FAMILY';
-
-  const renderAppointmentCard = (item) => (
+  const renderOperationsAppointmentCard = (item) => (
     <TouchableOpacity
       key={item.id}
       style={styles.card}
       onPress={() => {
-        if (isChatUser) {
-          router.push({
-            pathname: `/chat/${item.id}`,
-            params: {
-              role,
-              userId,
-              authToken,
-              clientName: item.client_name,
-              appointmentStartTime: item.start_time,
-              contextSource: 'selected_appointment',
-            },
-          });
-          return;
-        }
-
         router.push({
           pathname: `/appointment/${item.id}`,
           params: { role, userId, authToken },
@@ -157,27 +171,71 @@ export default function AppointmentList({ role, userId, authToken }) {
 
       <View style={styles.cardFooter}>
         <Text style={styles.datePill}>{formatDateOnly(item.start_time)}</Text>
-        {isChatUser ? (
-          <Text style={styles.cta}>Open thread</Text>
-        ) : (
-          <Text
-            style={[
-              styles.status,
-              item.readiness_status === 'READY' ? styles.ready : styles.atRisk,
-            ]}
-          >
-            {item.readiness_status}
-          </Text>
-        )}
+        <Text
+          style={[
+            styles.status,
+            item.readiness_status === 'READY' ? styles.ready : styles.atRisk,
+          ]}
+        >
+          {item.readiness_status}
+        </Text>
       </View>
     </TouchableOpacity>
   );
 
+  const renderConversationCard = (group) => {
+    const active = group.activeAppointment || group.appointments[0];
+    if (!active) return null;
+    return (
+      <TouchableOpacity
+        key={group.key}
+        style={styles.card}
+        onPress={() => {
+          router.push({
+            pathname: `/chat/${active.id}`,
+            params: {
+              role,
+              userId,
+              authToken,
+              clientName: group.clientName,
+              clientId: group.clientId || active.client_id || '',
+              appointmentStartTime: active.start_time,
+              contextSource: 'selected_client_conversation',
+            },
+          });
+        }}
+      >
+        <View style={styles.cardHeader}>
+          <View style={styles.headlineWrap}>
+            <Text style={styles.title}>{group.clientName}</Text>
+            <Text style={styles.subtitle}>
+              Active visit: {formatApptDateTime(active.start_time)}
+            </Text>
+            <Text style={styles.metaText}>{group.appointments.length} visit(s) available</Text>
+          </View>
+
+          <View style={[styles.iconBadge, styles.chatBadge]}>
+            <Ionicons name="chatbubble-ellipses" size={20} color={DS.colors.info} />
+          </View>
+        </View>
+
+        <View style={styles.cardFooter}>
+          <Text style={styles.datePill}>Client Conversation</Text>
+          <Text style={styles.cta}>Open chat</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.contentContainer}>
-        <Text style={styles.pageTitle}>{isChatUser ? 'Your Conversations' : 'Operations Board'}</Text>
-        <Text style={styles.pageSubtitle}>Current and soon visits are shown first. Future visits are collapsed by default.</Text>
+        <Text style={styles.pageTitle}>{isChatUser ? 'Client Conversations' : 'Operations Board'}</Text>
+        <Text style={styles.pageSubtitle}>
+          {isChatUser
+            ? 'Conversations are grouped by client. You can switch to another visit after opening chat.'
+            : 'Current and soon visits are shown first. Future visits are collapsed by default.'}
+        </Text>
 
         <View style={styles.filterBar}>
           <TouchableOpacity style={styles.filterPill} onPress={() => setClientModalOpen(true)}>
@@ -195,24 +253,37 @@ export default function AppointmentList({ role, userId, authToken }) {
           </TouchableOpacity>
         </View>
 
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Current & Soon</Text>
-          <Text style={styles.sectionMeta}>Operational window: yesterday through next 7 days</Text>
-        </View>
-        {operationalAppointments.map(renderAppointmentCard)}
-        {operationalAppointments.length === 0 ? <Text style={styles.empty}>No visits in the operational window.</Text> : null}
+        {isChatUser ? (
+          <>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Clients</Text>
+              <Text style={styles.sectionMeta}>{conversationGroups.length} conversation(s)</Text>
+            </View>
+            {conversationGroups.map(renderConversationCard)}
+          </>
+        ) : (
+          <>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Current & Soon</Text>
+              <Text style={styles.sectionMeta}>Operational window: yesterday through next 7 days</Text>
+            </View>
+            {operationalAppointments.map(renderOperationsAppointmentCard)}
+            {operationalAppointments.length === 0 ? <Text style={styles.empty}>No visits in the operational window.</Text> : null}
 
-        {laterAppointments.length > 0 ? (
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Later Appointments</Text>
-            <TouchableOpacity onPress={() => setShowLaterAppointments((prev) => !prev)} style={styles.toggleBtn}>
-              <Text style={styles.toggleBtnText}>{showLaterAppointments ? 'Hide' : `Show (${laterAppointments.length})`}</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
-        {showLaterAppointments ? laterAppointments.map(renderAppointmentCard) : null}
+            {laterAppointments.length > 0 ? (
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Later Appointments</Text>
+                <TouchableOpacity onPress={() => setShowLaterAppointments((prev) => !prev)} style={styles.toggleBtn}>
+                  <Text style={styles.toggleBtnText}>{showLaterAppointments ? 'Hide' : `Show (${laterAppointments.length})`}</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+            {showLaterAppointments ? laterAppointments.map(renderOperationsAppointmentCard) : null}
+          </>
+        )}
 
-        {filteredAppointments.length === 0 ? <Text style={styles.empty}>No conversations for these filters.</Text> : null}
+        {isChatUser && conversationGroups.length === 0 ? <Text style={styles.empty}>No client conversations for these filters.</Text> : null}
+        {!isChatUser && filteredAppointments.length === 0 ? <Text style={styles.empty}>No conversations for these filters.</Text> : null}
       </ScrollView>
 
       <Modal visible={clientModalOpen} animationType="slide" transparent onRequestClose={() => setClientModalOpen(false)}>
@@ -411,6 +482,19 @@ function splitAppointmentsByOperationalWindow(appointments) {
   }
 
   return { operationalAppointments, laterAppointments };
+}
+
+function pickConversationAppointment(appointments) {
+  if (!Array.isArray(appointments) || appointments.length === 0) return null;
+  const now = Date.now();
+  const upcoming = appointments
+    .filter((item) => {
+      const start = new Date(item.start_time || '').getTime();
+      return Number.isFinite(start) && start >= now;
+    })
+    .sort((a, b) => new Date(a.start_time || '').getTime() - new Date(b.start_time || '').getTime());
+  if (upcoming.length > 0) return upcoming[0];
+  return appointments[0];
 }
 
 const styles = StyleSheet.create({

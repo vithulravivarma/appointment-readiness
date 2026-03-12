@@ -37,6 +37,31 @@ Run this right before demo time:
 - Verify inbound row in `messages` has `channel='WHATSAPP'`.
 - Verify AI reply is delivered back to WhatsApp.
 
+## Twilio WhatsApp Production Checklist
+
+1. Production flags:
+- `WHATSAPP_ENABLED=true`
+- `WHATSAPP_TRIAL_MODE=false`
+- `WHATSAPP_MAX_INBOUND_CHARS` set (default `2000`)
+- `WHATSAPP_RATE_LIMIT_PER_ENDPOINT` set (default `30` / minute)
+- `WHATSAPP_STATUS_RETENTION_DAYS` set (default `30`)
+- `WHATSAPP_REDACT_LOGS=true`
+2. Endpoint mapping policy:
+- `channel_endpoints.active=true`
+- `channel_endpoints.verified=true` (required in production mode)
+- Use `metadata` fields for consent/audit (`opt_in_status`, `opt_in_source`, `opt_in_at`, `locale`, `last_delivery_status`).
+3. Recovery + retention:
+- Replay retryable failures: `npm run whatsapp:replay-failed -- <limit>`
+- Prune old webhook events: `npm run whatsapp:prune-events -- <days>`
+4. Monitoring signals:
+- `signature_invalid`
+- `inbound_processed`
+- `inbound_ignored` (reason-tagged)
+- `inbound_failed_retryable`
+- `outbound_send_success`
+- `outbound_send_failed`
+- `outbound_status_updated`
+
 ## Source Map
 
 Primary files:
@@ -124,7 +149,7 @@ Early exits:
 
 ### A3) Build planning command and context
 
-1. If `mergeWithPending`, merges prior pending base command + latest clarification.
+1. If `mergeWithPending`, builds planning command from pending base command + bounded clarification history (up to 4 recent clarifications) + latest clarification.
 2. Stores date hints (`today`, `tomorrow`, explicit date) into assistant memory.
 3. Loads caregiver appointments (`schedule.get_all` trace event).
 4. Resolves explicit context detection using both LLM and deterministic heuristics.
@@ -231,7 +256,8 @@ Contact confirmation prompt:
 Operational note:
 
 - Caregiver-facing Agent Desk now initiates delegation through `/agents/:userId/command` (tool route), not a dedicated manual form.
-- Backend endpoint support remains for delegation lifecycle management (`/agents/:userId/delegations/:appointmentId/stop`, summaries, state persistence).
+- Direct `POST /agents/:userId/delegations/start` is deprecated/blocked; delegation start must flow through `/agents/:userId/command` so contact confirmation is enforced.
+- Backend delegation lifecycle remains available for stop/history paths (`/agents/:userId/delegations/:appointmentId/stop`, summaries, state persistence).
 
 Critical checks enforced before normal delegation start:
 
@@ -258,6 +284,9 @@ Endpoint: `POST /agents/:userId/delegations/:appointmentId/stop`
 - extracts key points (LLM + fallback),
 - formats caregiver-readable summary via `buildCaregiverDelegationSummary()`.
 4. Marks delegation inactive and appends summary to `summaryHistory`.
+5. If this was caregiver-managed manual delegation that interrupted precheck:
+- If any critical check is `FAIL`, skip precheck restart and emit escalation/completion events.
+- Else if critical checks are incomplete, resume precheck gracefully (resume remaining checks when prior precheck responses existed; otherwise restart from first question).
 
 ## Workflow B: AI Interpreter (Family/Coordinator Chat Agent)
 
@@ -329,12 +358,10 @@ Before generating a family/coordinator-facing AI reply:
 
 If delegation is active and caregiver-managed:
 
-1. Generates progress updates when newly resolved primary items appear.
-2. Generates completion update when all required askable items resolved.
-3. Writes updates to `agent_desk_messages` with dedupe keys:
-- `delegation-progress:<appointmentId>:<startedAt>:<resolvedIndexesToken>`
+1. Generates completion update when all required askable items resolved (completion-only; no incremental progress updates).
+2. Writes completion update to `agent_desk_messages` with dedupe key:
 - `delegation-complete:<appointmentId>:<startedAt>`
-4. Persists delegation progress fields in `user_agents`:
+3. Persists delegation progress fields in `user_agents`:
 - `askedQuestionIndexes`
 - `resolvedQuestionIndexes`
 - `progressNotifiedIndexes`
@@ -389,7 +416,7 @@ Finds next eligible scheduled appointment per client where:
 
 This means precheck is represented using the same delegation structure as manual delegation, but marked system-managed.
 
-## Workflow D: Twilio WhatsApp Sandbox (Demo Path)
+## Workflow D: Twilio WhatsApp (Production-Hardened Path)
 
 Entrypoints in `appointment-management-service`:
 
@@ -401,12 +428,16 @@ Entrypoints in `appointment-management-service`:
 1. Verifies Twilio signature from `X-Twilio-Signature`.
 2. Uses `webhook_inbox_events` for idempotency on `(provider, provider_message_id)`.
 3. Normalizes `From`/`To` WhatsApp endpoints to E.164 format.
-4. Enforces trial allowlist when `WHATSAPP_TRIAL_MODE=true`.
-5. Rejects media for demo mode (`NumMedia > 0`).
-6. Resolves sender endpoint via `channel_endpoints` (`provider='twilio_whatsapp', entity_type='CLIENT'`).
-7. Resolves operational appointment context for that client.
-8. Writes inbound chat row to `messages` with `sender_type='FAMILY'` and `channel='WHATSAPP'`.
-9. Publishes enriched `NEW_MESSAGE` event to `incoming-messages-queue` with `channel/provider/fromEndpoint/toEndpoint/externalMessageId`.
+4. Enforces allowlist when configured (`WHATSAPP_ALLOWLIST_NUMBERS`) to support trial mode and emergency traffic brakes.
+5. Rejects media (`NumMedia > 0`) and oversized payloads (`WHATSAPP_MAX_INBOUND_CHARS`).
+6. Enforces endpoint rate limits (`WHATSAPP_RATE_LIMIT_PER_ENDPOINT`) and records `IGNORED_RATE_LIMITED`.
+7. Resolves sender endpoint via `channel_endpoints` (`provider='twilio_whatsapp', entity_type='CLIENT'`).
+8. In production mode (`WHATSAPP_TRIAL_MODE=false`), requires `verified=true`; otherwise records `IGNORED_UNVERIFIED_ENDPOINT`.
+9. Blocks inactive/blocked endpoints with `IGNORED_BLOCKED_ENDPOINT`.
+10. Resolves operational appointment context for that client.
+11. Writes inbound chat row to `messages` with `sender_type='FAMILY'` and `channel='WHATSAPP'`.
+12. Publishes enriched `NEW_MESSAGE` event to `incoming-messages-queue` with `channel/provider/fromEndpoint/toEndpoint/externalMessageId`.
+13. If queue publish fails, stores `FAILED_PROCESSING_RETRYABLE` and returns Twilio-friendly 2xx to avoid duplicate provider retries.
 
 ### D2) AI interpreter propagation
 
@@ -419,8 +450,42 @@ Entrypoints in `appointment-management-service`:
 
 1. `notification-service` handles `NotificationJob.type='WHATSAPP'`.
 2. Sends via Twilio Messages API (`from=TWILIO_WHATSAPP_FROM`, `to=whatsapp:+E164`, `Body=<reply text>`).
-3. Stores outbound provider metadata in `webhook_inbox_events` with provider `twilio_whatsapp_outbound`.
-4. Twilio status callbacks update outbound status through `POST /webhooks/twilio/whatsapp/status`.
+3. Enforces outbound text length guardrail and classifies Twilio failures into retryable/non-retryable classes.
+4. Stores outbound provider metadata in `webhook_inbox_events` with provider `twilio_whatsapp_outbound`.
+5. Twilio status callbacks update outbound status through `POST /webhooks/twilio/whatsapp/status`.
+6. Status callback updates `channel_endpoints.metadata.last_delivery_status` for endpoint-level observability.
+
+### D4) Recovery and retention operations
+
+1. Retryable inbound failures (`FAILED_PROCESSING_RETRYABLE`) are replayable via:
+- `npm run whatsapp:replay-failed -- <limit>`
+- or `POST /testing/whatsapp/replay-failed-inbound`
+2. Webhook ledger retention is managed via:
+- `npm run whatsapp:prune-events -- <days>`
+- or `POST /testing/whatsapp/prune-webhook-events`
+
+## Twilio Paid Plan Request Packet
+
+1. Account and sender onboarding:
+- Upgrade account from trial.
+- WhatsApp Business sender onboarding for dedicated business number.
+- Confirmation of sender display name and sender status timeline.
+2. Credentials and webhook assets:
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_API_KEY_SID` + `TWILIO_API_KEY_SECRET`
+- `TWILIO_AUTH_TOKEN`
+- Production `TWILIO_WHATSAPP_FROM`
+- Registered inbound + status webhook callback URLs.
+3. Commercial + policy asks:
+- Pricing and monthly cost estimate at expected volume.
+- Conversation category/template requirements for business-initiated messages.
+- Rate limits, quality controls, and support escalation path.
+- Data residency/compliance documents needed by your org.
+4. Internal prep before requesting:
+- Legal business name, website/domain.
+- Use-case summary and sample messages.
+- Estimated monthly message volume and target countries.
+- Privacy policy and terms links.
 
 ## Chat Dissection Examples
 
@@ -480,8 +545,8 @@ Dissection:
 4. Delegation question assessment marks first question answered with high confidence.
 5. Completion evaluator updates resolved indexes.
 6. AI reply generated with next forced question if needed.
-7. Progress update written to Agent Desk (`DELEGATION_PROGRESS`) with newly resolved primary index.
-8. `resolvedQuestionIndexes` and `progressNotifiedIndexes` persisted.
+7. No incremental Agent Desk progress update is written (completion-only mode).
+8. `resolvedQuestionIndexes` is persisted.
 
 ### Example 4: System precheck finishes with blocker
 
@@ -517,7 +582,6 @@ AI interpreter:
 
 - `OPENAI_API_KEY`
 - `ASSISTANT_DELEGATION_COMPLETION_NOTIFY_V1`
-- `ASSISTANT_DELEGATION_PROGRESS_NOTIFY_V1`
 - `READINESS_MIN_CONFIDENCE`
 - `READINESS_REQUIRE_REASONING`
 - `SQS_POLL_WAIT_SECONDS`
@@ -555,7 +619,6 @@ Query `agent_desk_messages` by caregiver thread and sort by `created_at DESC`.
 Look for:
 
 - `source='AGENT_COMMAND'`
-- `source='DELEGATION_PROGRESS'`
 - `source='DELEGATION_COMPLETION'`
 - dedupe behavior by `dedupe_key`.
 
@@ -594,14 +657,21 @@ Useful when precheck appears stuck or you need a clean replay:
 - `POST /appointments/:id/precheck/reset` to clear precheck markers/messages for one appointment and requeue readiness evaluation.
 - `POST /precheck/reset-all` to clear global markers/messages and requeue eligible appointments.
 
+Additional timeline event now used for interruption/debug:
+
+- `PRECHECK_INTERRUPTED` when a manual delegation overrides an active system precheck.
+- `PRECHECK_RESUMED` when precheck is resumed/restarted after manual delegation completion.
+
 ## Known Design Behaviors (Important for Debugging)
 
 1. START_DELEGATION is confirmation-gated by design.
 2. Missing-info policy can convert an answer path into delegation confirmation when facts are unknown.
-3. Manual delegation completion does not auto-stop delegation; it posts progress/completion updates.
-4. Precheck summary writes are blocked for caregiver-managed manual delegations to avoid overwrite.
-5. Agent Desk persistence can degrade gracefully to legacy assistant history if `agent_desk_*` schema is missing.
-6. Non-tool responses are sanitized to avoid false claims that actions were already executed.
+3. Manual delegation completion does not auto-stop delegation; it posts completion updates only.
+4. If caregiver sends a direct patient-chat message, active caregiver-managed delegation for that visit auto-ends.
+5. New delegation asks during an active caregiver-managed window are appended into that same delegation (no new window created).
+6. Precheck summary writes are blocked for caregiver-managed manual delegations to avoid overwrite.
+7. Agent Desk persistence can degrade gracefully to legacy assistant history if `agent_desk_*` schema is missing.
+8. Non-tool responses are sanitized to avoid false claims that actions were already executed.
 
 ## Test Coverage Pointers
 

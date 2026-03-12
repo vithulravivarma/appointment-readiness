@@ -1,4 +1,5 @@
 import { Message, SQSClient } from '@aws-sdk/client-sqs';
+import crypto from 'crypto';
 import { Pool } from 'pg'; 
 import {
   QUEUES,
@@ -8,6 +9,7 @@ import {
   type PrecheckCheckType,
 } from '@ar/types';
 import { NonRetryableMessageError, subscribeToQueue, publishMessage } from './sqs';
+import { loadConfig } from './config';
 // Make sure updateCheckStatus is imported from your repository
 import { ensureChecklistExists, getReadinessState, updateReadinessStatus, updateCheckStatus } from './repository';
 import { evaluateReadiness } from './logic';
@@ -28,14 +30,127 @@ interface AIUpdateEvent {
 
 interface PrecheckCandidate {
   appointmentId: string;
+  clientId: string;
   caregiverId: string;
   clientName: string;
   startTime: string;
   serviceType: string | null;
 }
 const BUSINESS_TIME_ZONE = 'America/Los_Angeles';
+const WHATSAPP_KICKOFF_SUPPRESS_MINUTES = 60;
 const READINESS_EVALUATION_CONSUMER = 'readiness-engine.readiness-evaluation';
 const READINESS_UPDATES_CONSUMER = 'readiness-engine.readiness-updates';
+const config = loadConfig();
+
+async function resolvePrimaryVerifiedWhatsAppEndpoint(
+  pool: Pool,
+  clientId: string,
+): Promise<string | null> {
+  const endpointRes = await pool.query(
+    `
+      SELECT endpoint
+      FROM channel_endpoints
+      WHERE provider = 'twilio_whatsapp'
+        AND entity_type = 'CLIENT'
+        AND entity_id = $1::uuid
+        AND active = true
+        AND verified = true
+        AND COALESCE(metadata->>'blocked', 'false') NOT IN ('true', '1', 'yes')
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `,
+    [clientId],
+  );
+  return endpointRes.rows[0]?.endpoint ? String(endpointRes.rows[0].endpoint) : null;
+}
+
+async function fanoutPrecheckKickoffToWhatsApp(input: {
+  sqsClient: SQSClient;
+  pool: Pool;
+  appointmentId: string;
+  clientId: string;
+  kickoffMessage: string;
+}): Promise<void> {
+  if (!config.whatsapp.enabled) return;
+  const toEndpoint = await resolvePrimaryVerifiedWhatsAppEndpoint(input.pool, input.clientId);
+  if (!toEndpoint) return;
+
+  const hash = crypto.createHash('sha1').update(input.kickoffMessage.trim().toLowerCase()).digest('hex').slice(0, 16);
+  const bucket = Math.floor(Date.now() / (WHATSAPP_KICKOFF_SUPPRESS_MINUTES * 60 * 1000));
+  const dedupeKey = `PRECHECK:${input.appointmentId}:${toEndpoint}:${hash}:${bucket}`;
+
+  const dedupeInsert = await input.pool.query(
+    `
+      INSERT INTO webhook_inbox_events (
+        provider,
+        provider_message_id,
+        event_type,
+        status,
+        payload
+      )
+      VALUES ($1, $2, 'OUTBOUND', 'QUEUED', $3::jsonb)
+      ON CONFLICT (provider, provider_message_id) DO NOTHING
+      RETURNING id
+    `,
+    [
+      'twilio_whatsapp_kickoff',
+      dedupeKey,
+      JSON.stringify({
+        appointmentId: input.appointmentId,
+        toEndpoint,
+        kickoffType: 'PRECHECK',
+      }),
+    ],
+  );
+  if (dedupeInsert.rows.length === 0) return;
+
+  const notification: NotificationJob = {
+    type: 'WHATSAPP',
+    recipient: toEndpoint,
+    templateId: 'WHATSAPP_KICKOFF',
+    data: {
+      appointmentId: input.appointmentId,
+      replyText: input.kickoffMessage,
+      kickoffType: 'PRECHECK',
+    },
+    correlationId: dedupeKey,
+    provider: 'TWILIO_WHATSAPP',
+    toEndpoint,
+    conversationRef: input.appointmentId,
+  };
+
+  try {
+    await publishMessage(input.sqsClient, QUEUES.NOTIFICATION, notification);
+    await input.pool.query(
+      `
+        UPDATE webhook_inbox_events
+        SET status = 'DISPATCHED',
+            processed_at = NOW()
+        WHERE provider = $1 AND provider_message_id = $2
+      `,
+      ['twilio_whatsapp_kickoff', dedupeKey],
+    );
+  } catch (error) {
+    await input.pool.query(
+      `
+        UPDATE webhook_inbox_events
+        SET status = 'FAILED_PROCESSING_RETRYABLE',
+            payload = payload || $3::jsonb,
+            processed_at = NOW()
+        WHERE provider = $1 AND provider_message_id = $2
+      `,
+      [
+        'twilio_whatsapp_kickoff',
+        dedupeKey,
+        JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
+      ],
+    );
+    console.warn('[HANDLERS] WhatsApp precheck kickoff dispatch failed (non-blocking)', {
+      appointmentId: input.appointmentId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 export async function handleReadinessEvaluation(
   message: Message, 
@@ -94,7 +209,7 @@ export async function handleReadinessEvaluation(
     await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
   }
 
-  await kickoffPendingPrecheckConversations(pool);
+  await kickoffPendingPrecheckConversations(pool, sqsClient);
   await markPersistentProcessedMessage(pool, key, 'SUCCEEDED', {
     appointmentId: event.appointmentId,
     trigger: event.trigger,
@@ -115,7 +230,7 @@ export async function initializeConsumers(sqsClient: SQSClient, pool: Pool): Pro
   );
 
   // Event-driven kickoff scan: ingestion/lifecycle/AI update events trigger this.
-  await kickoffPendingPrecheckConversations(pool);
+  await kickoffPendingPrecheckConversations(pool, sqsClient);
   
   console.log('[HANDLERS] Consumers initialized', {
     queues: [QUEUES.READINESS_EVALUATION, QUEUES.READINESS_UPDATES],
@@ -197,7 +312,7 @@ export async function handleAISignal(message: Message, sqsClient: SQSClient, poo
     }
   }
 
-  await kickoffPendingPrecheckConversations(pool);
+  await kickoffPendingPrecheckConversations(pool, sqsClient);
   await markPersistentProcessedMessage(pool, key, 'SUCCEEDED', {
     appointmentId: event.appointmentId,
     checkType: event.checkType,
@@ -205,7 +320,7 @@ export async function handleAISignal(message: Message, sqsClient: SQSClient, poo
   });
 }
 
-async function kickoffPendingPrecheckConversations(pool: Pool): Promise<void> {
+async function kickoffPendingPrecheckConversations(pool: Pool, sqsClient: SQSClient): Promise<void> {
   const batchSizeRaw = Number(process.env.PRECHECK_KICKOFF_BATCH_SIZE || '100');
   const batchSize = Number.isFinite(batchSizeRaw)
     ? Math.max(1, Math.min(500, Math.trunc(batchSizeRaw)))
@@ -232,7 +347,7 @@ async function kickoffPendingPrecheckConversations(pool: Pool): Promise<void> {
 
     for (const candidate of candidates) {
       try {
-        const started = await startPrecheckConversation(pool, candidate);
+        const started = await startPrecheckConversation(pool, sqsClient, candidate);
         if (started) {
           startedThisCycle += 1;
           totalStarted += 1;
@@ -291,6 +406,7 @@ async function findPrecheckCandidates(pool: Pool, limit: number): Promise<Preche
       )
       SELECT
         r.id::text AS appointment_id,
+        r.client_id::text AS client_id,
         r.caregiver_id::text AS caregiver_id,
         r.client_name,
         r.start_time,
@@ -330,6 +446,7 @@ async function findPrecheckCandidates(pool: Pool, limit: number): Promise<Preche
 
   return res.rows.map((row) => ({
     appointmentId: String(row.appointment_id),
+    clientId: String(row.client_id),
     caregiverId: String(row.caregiver_id),
     clientName: String(row.client_name),
     startTime: new Date(row.start_time).toISOString(),
@@ -337,7 +454,7 @@ async function findPrecheckCandidates(pool: Pool, limit: number): Promise<Preche
   }));
 }
 
-async function startPrecheckConversation(pool: Pool, candidate: PrecheckCandidate): Promise<boolean> {
+async function startPrecheckConversation(pool: Pool, sqsClient: SQSClient, candidate: PrecheckCandidate): Promise<boolean> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -468,6 +585,13 @@ async function startPrecheckConversation(pool: Pool, candidate: PrecheckCandidat
     );
 
     await client.query('COMMIT');
+    await fanoutPrecheckKickoffToWhatsApp({
+      sqsClient,
+      pool,
+      appointmentId: candidate.appointmentId,
+      clientId: candidate.clientId,
+      kickoffMessage: intro,
+    });
     return true;
   } catch (error) {
     await client.query('ROLLBACK');

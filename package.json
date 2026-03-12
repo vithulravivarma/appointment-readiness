@@ -9,6 +9,8 @@
     "dev:readiness": "npm run dev --workspace=services/readiness-engine",
     "migrate": "ts-node scripts/migrate.ts",
     "backfill:agent-desk": "ts-node scripts/backfill-agent-desk-history.ts",
+    "whatsapp:replay-failed": "ts-node scripts/replay-whatsapp-failed-inbound.ts",
+    "whatsapp:prune-events": "ts-node scripts/prune-webhook-events.ts",
     "test": "jest",
     "smoke": "./scripts/e2e-smoke.sh",
     "test:isolation": "bash ./scripts/e2e-chat-isolation.sh",

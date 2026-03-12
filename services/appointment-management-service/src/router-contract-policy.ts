@@ -1,5 +1,5 @@
 export type RouterAction = 'RESPOND' | 'ASK_FOLLOW_UP' | 'USE_TOOL';
-export type RouterTool = 'SCHEDULE_DAY' | 'MAPS_ROUTE' | 'CLIENT_INFO' | 'START_DELEGATION';
+export type RouterTool = 'SCHEDULE_DAY' | 'MAPS_ROUTE' | 'CLIENT_INFO' | 'START_DELEGATION' | 'ESCALATE_SCHEDULER';
 export type RouterRequiredSlot =
   | 'APPOINTMENT_TARGET'
   | 'HOME_ADDRESS'
@@ -61,7 +61,7 @@ export function inferRequiredSlots(input: {
     inferred.push('HOME_ADDRESS');
   }
 
-  if (input.tool === 'CLIENT_INFO' || input.tool === 'START_DELEGATION') {
+  if (input.tool === 'CLIENT_INFO' || input.tool === 'START_DELEGATION' || input.tool === 'ESCALATE_SCHEDULER') {
     inferred.push('APPOINTMENT_TARGET');
   }
 

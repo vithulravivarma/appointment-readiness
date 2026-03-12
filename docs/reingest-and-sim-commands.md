@@ -150,6 +150,7 @@ Demo-only env flags to verify before running:
 ```bash
 echo "$WHATSAPP_ENABLED $WHATSAPP_TRIAL_MODE $TWILIO_ACCOUNT_SID $TWILIO_WHATSAPP_FROM"
 echo "$WHATSAPP_ALLOWLIST_NUMBERS"
+echo "$WHATSAPP_MAX_INBOUND_CHARS $WHATSAPP_RATE_LIMIT_PER_ENDPOINT $WHATSAPP_STATUS_RETENTION_DAYS $WHATSAPP_REDACT_LOGS"
 ```
 
 ### Quick Cloudflare tunnel (simple mode)
@@ -197,6 +198,41 @@ docker exec appointment-readiness-postgres psql -U postgres -d postgres -c "SELE
 ```
 
 If the UUID changes after a future reingest, use the new UUID from step 1 in steps 2 and 3.
+
+### Production WhatsApp controls + recovery
+
+Use this for post-sandbox/paid rollout checks.
+
+```bash
+# Recommended production flags
+echo "$WHATSAPP_ENABLED $WHATSAPP_TRIAL_MODE"
+echo "$WHATSAPP_MAX_INBOUND_CHARS $WHATSAPP_RATE_LIMIT_PER_ENDPOINT $WHATSAPP_STATUS_RETENTION_DAYS $WHATSAPP_REDACT_LOGS"
+```
+
+Replay retryable inbound failures (`FAILED_PROCESSING_RETRYABLE`):
+
+```bash
+npm run whatsapp:replay-failed -- 100
+```
+
+Prune old webhook ledger rows:
+
+```bash
+npm run whatsapp:prune-events -- 30
+```
+
+Optional API operations for the same tasks:
+
+```bash
+curl -sS -X POST "http://localhost:3001/testing/whatsapp/replay-failed-inbound?limit=100" | jq
+curl -sS -X POST "http://localhost:3001/testing/whatsapp/prune-webhook-events?retentionDays=30" | jq
+```
+
+Query endpoint consent/delivery metadata:
+
+```bash
+docker exec appointment-readiness-postgres psql -U postgres -d postgres -c "SELECT provider, endpoint, verified, active, metadata->>'opt_in_status' AS opt_in_status, metadata->>'opt_in_source' AS opt_in_source, metadata->>'opt_in_at' AS opt_in_at, metadata->>'locale' AS locale, metadata->>'last_delivery_status' AS last_delivery_status FROM channel_endpoints WHERE provider='twilio_whatsapp' ORDER BY updated_at DESC;"
+```
 
 ## Troubleshooting
 

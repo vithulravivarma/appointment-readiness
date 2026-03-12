@@ -16,6 +16,9 @@ export interface Config {
     accessKeyId: string;
     secretAccessKey: string;
   };
+  whatsapp: {
+    enabled: boolean;
+  };
 }
 
 export function loadConfig(): Config {
@@ -29,6 +32,8 @@ export function loadConfig(): Config {
   const sqsRegion = process.env.AWS_REGION || 'us-east-1';
   const sqsAccessKeyId = process.env.AWS_ACCESS_KEY_ID || 'test';
   const sqsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || 'test';
+  const whatsappEnabledRaw = String(process.env.WHATSAPP_ENABLED || 'true').toLowerCase();
+  const whatsappEnabled = whatsappEnabledRaw === '1' || whatsappEnabledRaw === 'true' || whatsappEnabledRaw === 'yes';
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
@@ -45,6 +50,9 @@ export function loadConfig(): Config {
       region: sqsRegion,
       accessKeyId: sqsAccessKeyId,
       secretAccessKey: sqsSecretAccessKey,
+    },
+    whatsapp: {
+      enabled: whatsappEnabled,
     },
   };
 }

@@ -159,6 +159,10 @@ When `precheckActive` and planner is complete:
 Important behavior:
 
 - Precheck completion does not overwrite caregiver-managed manual delegation summaries.
+- If manual delegation overrides active precheck, interruption is marked with `PRECHECK_INTERRUPTED`.
+- After manual delegation stop, precheck recovery can occur:
+  - critical `FAIL` present: no restart, escalate immediately,
+  - no critical `FAIL` but incomplete: resume/restart with a graceful client-facing notice.
 
 ## Reset and Replay Operations
 

@@ -6,6 +6,10 @@ import { NonRetryableMessageError, subscribeToQueue } from './sqs';
 
 const config = loadConfig();
 
+function metric(name: string, fields: Record<string, unknown>): void {
+  console.log('[METRIC]', JSON.stringify({ scope: 'whatsapp', name, ...fields }));
+}
+
 function normalizePhoneEndpoint(value: unknown): string {
   let raw = String(value || '').trim();
   if (!raw) return '';
@@ -18,6 +22,13 @@ function normalizePhoneEndpoint(value: unknown): string {
   }
   if (!/^\+\d{7,15}$/.test(raw)) return '';
   return raw;
+}
+
+function redactEndpoint(endpoint: string): string {
+  if (!config.whatsapp.redactLogs) return endpoint;
+  const normalized = normalizePhoneEndpoint(endpoint);
+  if (!normalized) return 'unknown';
+  return `${normalized.slice(0, 3)}***${normalized.slice(-2)}`;
 }
 
 function formatTwilioWhatsAppEndpoint(value: string): string {
@@ -99,6 +110,12 @@ async function sendWhatsAppViaTwilio(job: NotificationJob): Promise<void> {
   if (!replyText) {
     throw new NonRetryableMessageError('WHATSAPP notification missing reply text', 'MISSING_WHATSAPP_TEXT');
   }
+  if (replyText.length > config.whatsapp.maxInboundChars) {
+    throw new NonRetryableMessageError(
+      `WHATSAPP reply exceeds maximum length (${replyText.length}/${config.whatsapp.maxInboundChars})`,
+      'WHATSAPP_TEXT_TOO_LONG',
+    );
+  }
 
   const body = new URLSearchParams();
   body.set('To', toTwilio);
@@ -122,6 +139,11 @@ async function sendWhatsAppViaTwilio(job: NotificationJob): Promise<void> {
   if (!response.ok) {
     const errorCode = String(payload.code || '').trim();
     const errorMessage = String(payload.message || `Twilio API request failed with status ${response.status}`);
+    metric('outbound_send_failed', {
+      statusCode: response.status,
+      errorCode: errorCode || null,
+      retryClass: response.status >= 400 && response.status < 500 && response.status !== 429 ? 'NON_RETRYABLE' : 'RETRYABLE',
+    });
     if (response.status >= 400 && response.status < 500 && response.status !== 429) {
       throw new NonRetryableMessageError(
         `Twilio WHATSAPP send rejected (${errorCode || response.status}): ${errorMessage}`,
@@ -147,9 +169,13 @@ async function sendWhatsAppViaTwilio(job: NotificationJob): Promise<void> {
     },
   });
 
+  metric('outbound_send_success', {
+    providerMessageId,
+    twilioStatus: String(payload.status || 'QUEUED').toUpperCase(),
+  });
   console.log('[NOTIFICATION] 📲 WHATSAPP sent', {
-    to: toEndpoint,
-    from: fromEndpoint,
+    to: redactEndpoint(toEndpoint),
+    from: config.whatsapp.redactLogs ? 'redacted' : fromEndpoint,
     providerMessageId,
   });
 }
@@ -178,7 +204,12 @@ export async function handleNotification(message: Message): Promise<void> {
 
   console.log(`[NOTIFICATION] 📨 Processing ${job.type} for ${job.recipient}`);
   console.log(`[NOTIFICATION]    Template: ${job.templateId}`);
-  console.log('[NOTIFICATION]    Context:', job.data);
+  console.log(
+    '[NOTIFICATION]    Context:',
+    job.type === 'WHATSAPP' && config.whatsapp.redactLogs
+      ? { redacted: true, keys: Object.keys(job.data || {}) }
+      : job.data,
+  );
 
   if (job.type === 'WHATSAPP') {
     await sendWhatsAppViaTwilio(job);

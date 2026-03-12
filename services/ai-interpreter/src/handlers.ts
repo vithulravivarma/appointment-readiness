@@ -23,7 +23,6 @@ import {
 } from './idempotency-store';
 import {
   evaluateDelegationCompletion,
-  formatDelegationProgressUpdate,
 } from './delegation-completion-policy';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -717,19 +716,51 @@ function buildDelegationCompletionDedupeKey(input: {
   return `delegation-complete:${input.appointmentId}:${startedAt}`;
 }
 
-function buildDelegationProgressDedupeKey(input: {
+function buildDelegationQuestionEscalationDedupeKey(input: {
   appointmentId: string;
-  startedAt?: string;
-  resolvedPrimaryIndexes: number[];
+  clientQuestion: string;
 }): string {
-  const startedAt = String(input.startedAt || '').trim() || 'unknown-start';
-  const resolved = [...input.resolvedPrimaryIndexes]
-    .map((idx) => Number(idx))
-    .filter((idx) => Number.isInteger(idx) && idx >= 0)
-    .sort((a, b) => a - b)
-    .join(',');
-  const token = resolved || 'none';
-  return `delegation-progress:${input.appointmentId}:${startedAt}:${token}`;
+  const normalizedQuestion = String(input.clientQuestion || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const digest = crypto.createHash('sha1').update(normalizedQuestion).digest('hex').slice(0, 16);
+  return `delegation-escalation:${input.appointmentId}:${digest}`;
+}
+
+function normalizeEscalationSignalText(value: string): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isLikelyUnresolvedDelegationReply(input: {
+  clientMessage: string;
+  agentReply: string;
+}): boolean {
+  const client = normalizeEscalationSignalText(input.clientMessage);
+  const reply = normalizeEscalationSignalText(input.agentReply);
+  if (!client || !reply) return false;
+
+  const looksLikeQuestion =
+    /[?]/.test(String(input.clientMessage || '')) ||
+    /\b(what|why|how|when|where|who|does|do|is|are|can|could|would|should)\b/.test(client);
+  if (!looksLikeQuestion) return false;
+
+  const unresolvedSignals = [
+    'i don t have specific information',
+    'i do not have specific information',
+    'i don t have that information',
+    'i do not have that information',
+    'i don t know',
+    'i do not know',
+    'best to ask',
+    'ask directly',
+    'you might want to ask',
+    'i m unable to answer',
+    'i am unable to answer',
+  ];
+
+  return unresolvedSignals.some((signal) => reply.includes(signal));
 }
 
 function normalizeDelegationIndexList(values: unknown, questionCount: number): number[] {
@@ -814,7 +845,7 @@ async function appendAgentDeskDelegationUpdateMessage(input: {
   caregiverId: string;
   appointmentId: string;
   content: string;
-  source: 'DELEGATION_PROGRESS' | 'DELEGATION_COMPLETION';
+  source: 'DELEGATION_PROGRESS' | 'DELEGATION_COMPLETION' | 'DELEGATION_ESCALATION';
   dedupeKey: string;
   metadata: Record<string, unknown>;
 }): Promise<string | null> {
@@ -878,6 +909,221 @@ async function appendAgentDeskDelegationUpdateMessage(input: {
     }
     throw error;
   }
+}
+
+async function openOrReuseDelegationQuestionEscalation(input: {
+  pool: Pool;
+  caregiverId: string;
+  appointmentId: string;
+  clientName: string;
+  clientQuestion: string;
+  agentReply: string;
+}): Promise<{ escalationId: string; reused: boolean }> {
+  const normalizedQuestion = normalizeEscalationSignalText(input.clientQuestion);
+  const existingRes = await input.pool.query(
+    `
+      SELECT id::text
+      FROM escalations
+      WHERE caregiver_id = $1
+        AND appointment_id = $2::uuid
+        AND category = 'CLIENT_QUESTION_NEEDS_CAREGIVER'
+        AND status IN ('OPEN', 'ACKNOWLEDGED', 'ACTION_REQUESTED')
+        AND COALESCE(context_json->>'clientQuestionNormalized', '') = $3
+      ORDER BY opened_at DESC
+      LIMIT 1
+    `,
+    [input.caregiverId, input.appointmentId, normalizedQuestion],
+  );
+  if (existingRes.rows.length > 0) {
+    return {
+      escalationId: String(existingRes.rows[0].id || ''),
+      reused: true,
+    };
+  }
+
+  const summary = [
+    `Client asked a question that needs caregiver input for ${input.clientName}.`,
+    `Question: "${compactText(input.clientQuestion, 180)}"`,
+  ].join(' ');
+  const context = {
+    clientQuestion: input.clientQuestion,
+    clientQuestionNormalized: normalizedQuestion,
+    agentReply: input.agentReply,
+    source: 'AI_INTERPRETER_DELEGATION',
+  };
+  const insertRes = await input.pool.query(
+    `
+      INSERT INTO escalations (
+        caregiver_id,
+        appointment_id,
+        source,
+        category,
+        priority,
+        status,
+        summary,
+        context_json,
+        opened_by,
+        opened_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2::uuid,
+        'DELEGATED_CHAT',
+        'CLIENT_QUESTION_NEEDS_CAREGIVER',
+        'HIGH',
+        'OPEN',
+        $3,
+        $4::jsonb,
+        'AI_AGENT',
+        NOW(),
+        NOW(),
+        NOW()
+      )
+      RETURNING id::text
+    `,
+    [input.caregiverId, input.appointmentId, summary, JSON.stringify(context)],
+  );
+  return {
+    escalationId: String(insertRes.rows[0]?.id || ''),
+    reused: false,
+  };
+}
+
+async function ensureSchedulerThread(pool: Pool, caregiverId: string): Promise<string> {
+  const existing = await pool.query(
+    `
+      SELECT id::text
+      FROM scheduler_threads
+      WHERE caregiver_id = $1
+      LIMIT 1
+    `,
+    [caregiverId],
+  );
+  if (existing.rows.length > 0) {
+    return String(existing.rows[0]?.id || '');
+  }
+
+  const inserted = await pool.query(
+    `
+      INSERT INTO scheduler_threads (caregiver_id, active, updated_at)
+      VALUES ($1, true, NOW())
+      ON CONFLICT (caregiver_id)
+      DO UPDATE SET
+        active = true,
+        updated_at = NOW()
+      RETURNING id::text
+    `,
+    [caregiverId],
+  );
+  return String(inserted.rows[0]?.id || '');
+}
+
+async function appendSchedulerThreadSystemMessage(input: {
+  pool: Pool;
+  caregiverId: string;
+  escalationId: string;
+  content: string;
+  metadata: Record<string, unknown>;
+}): Promise<void> {
+  const threadId = await ensureSchedulerThread(input.pool, input.caregiverId);
+  await input.pool.query(
+    `
+      INSERT INTO scheduler_thread_messages (
+        thread_id,
+        sender_type,
+        sender_id,
+        content,
+        escalation_id,
+        metadata_json
+      )
+      VALUES ($1::uuid, 'SYSTEM', NULL, $2, $3::uuid, $4::jsonb)
+    `,
+    [threadId, input.content, input.escalationId, JSON.stringify(input.metadata || {})],
+  );
+  await input.pool.query(
+    `
+      UPDATE scheduler_threads
+      SET updated_at = NOW()
+      WHERE id = $1::uuid
+    `,
+    [threadId],
+  );
+}
+
+async function openOrReusePrecheckCriticalFailEscalation(input: {
+  pool: Pool;
+  caregiverId: string;
+  appointmentId: string;
+  clientName: string;
+  failedChecks: string[];
+  precheckSummary: string;
+}): Promise<{ escalationId: string; reused: boolean }> {
+  const existingRes = await input.pool.query(
+    `
+      SELECT id::text
+      FROM escalations
+      WHERE caregiver_id = $1
+        AND appointment_id = $2::uuid
+        AND category = 'PRECHECK_CRITICAL_FAIL'
+        AND status IN ('OPEN', 'ACKNOWLEDGED', 'ACTION_REQUESTED')
+      ORDER BY opened_at DESC
+      LIMIT 1
+    `,
+    [input.caregiverId, input.appointmentId],
+  );
+  if (existingRes.rows.length > 0) {
+    return {
+      escalationId: String(existingRes.rows[0]?.id || ''),
+      reused: true,
+    };
+  }
+
+  const summary = `Precheck critical fail for ${input.clientName}: ${input.failedChecks.join(', ')}.`;
+  const context = {
+    failedChecks: input.failedChecks,
+    precheckSummary: input.precheckSummary,
+    source: 'AI_INTERPRETER_PRECHECK',
+  };
+  const insertRes = await input.pool.query(
+    `
+      INSERT INTO escalations (
+        caregiver_id,
+        appointment_id,
+        source,
+        category,
+        priority,
+        status,
+        summary,
+        context_json,
+        opened_by,
+        opened_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2::uuid,
+        'PRECHECK_AUTOMATION',
+        'PRECHECK_CRITICAL_FAIL',
+        'HIGH',
+        'OPEN',
+        $3,
+        $4::jsonb,
+        'SYSTEM',
+        NOW(),
+        NOW(),
+        NOW()
+      )
+      RETURNING id::text
+    `,
+    [input.caregiverId, input.appointmentId, summary, JSON.stringify(context)],
+  );
+  return {
+    escalationId: String(insertRes.rows[0]?.id || ''),
+    reused: false,
+  };
 }
 
 // --- CONSUMER LOOP ---
@@ -1087,11 +1333,64 @@ async function processChatMessage(
     readinessUpdates = await runReadinessAnalysis(sqs, pool, text, appointmentId, senderType, updatesQueueUrl, messageId);
   }
 
+  if (senderType === 'CAREGIVER') {
+    await maybeAutoEndManualDelegationOnCaregiverChat(pool, appointmentId);
+  }
+
   // --- JOB 2: Delegated conversation mode ---
   // Caregiver delegation controls whether AI can respond to non-caregiver participants.
   if (senderType === 'FAMILY' || senderType === 'COORDINATOR') {
     await runCaregiverAgent(sqs, pool, text, appointmentId, readinessUpdates, channelContext, notificationQueueUrl, messageId);
   }
+}
+
+async function maybeAutoEndManualDelegationOnCaregiverChat(pool: Pool, appointmentId: string): Promise<void> {
+  const apptRes = await pool.query(
+    `
+      SELECT caregiver_id::text AS caregiver_id
+      FROM appointments
+      WHERE id = $1::uuid
+      LIMIT 1
+    `,
+    [appointmentId],
+  );
+  if (apptRes.rows.length === 0) return;
+  const caregiverId = String(apptRes.rows[0]?.caregiver_id || '').trim();
+  if (!caregiverId) return;
+
+  const agentRes = await pool.query(
+    `
+      SELECT persona_settings
+      FROM user_agents
+      WHERE user_id = $1
+      LIMIT 1
+    `,
+    [caregiverId],
+  );
+  const settings = (agentRes.rows[0]?.persona_settings || {}) as Record<string, any>;
+  const delegations = { ...(settings.delegations || {}) } as Record<string, any>;
+  const delegation = delegations[appointmentId];
+  if (!delegation || !delegation.active) return;
+  if (isSystemManagedDelegationEntry(delegation)) return;
+
+  delegations[appointmentId] = {
+    ...delegation,
+    active: false,
+    endedAt: new Date().toISOString(),
+    autoEndedReason: 'CAREGIVER_RESUMED_DIRECT_CHAT',
+  };
+  const updatedSettings = {
+    ...settings,
+    delegations,
+  };
+  await pool.query(
+    `UPDATE user_agents SET persona_settings = $2::jsonb WHERE user_id = $1`,
+    [caregiverId, JSON.stringify(updatedSettings)],
+  );
+  console.log('[AI] Auto-ended active manual delegation due to caregiver patient-chat message', {
+    appointmentId,
+    caregiverId,
+  });
 }
 
 async function classifyReadinessUpdates(
@@ -1487,6 +1786,60 @@ async function runCaregiverAgent(
     });
   }
 
+  let delegationEscalationId: string | null = null;
+  let escalationDeskMessageId: string | null = null;
+  const shouldEscalateUnresolvedClientQuestion =
+    delegationActive &&
+    !delegationIsSystemManaged &&
+    isLikelyUnresolvedDelegationReply({
+      clientMessage: userText,
+      agentReply: replyText,
+    });
+  if (shouldEscalateUnresolvedClientQuestion) {
+    try {
+      const escalation = await openOrReuseDelegationQuestionEscalation({
+        pool,
+        caregiverId,
+        appointmentId,
+        clientName,
+        clientQuestion: userText,
+        agentReply: replyText,
+      });
+      delegationEscalationId = escalation.escalationId;
+      const escalationPrompt = [
+        `Escalation for ${clientName}: The client asked "${compactText(userText, 200)}" and I need your guidance to answer accurately.`,
+        'Reply here with what I should send, or message in patient chat to take over directly.',
+      ].join(' ');
+      escalationDeskMessageId = await appendAgentDeskDelegationUpdateMessage({
+        pool,
+        caregiverId,
+        appointmentId,
+        content: escalationPrompt,
+        source: 'DELEGATION_ESCALATION',
+        dedupeKey: buildDelegationQuestionEscalationDedupeKey({
+          appointmentId,
+          clientQuestion: userText,
+        }),
+        metadata: {
+          appointmentId,
+          caregiverId,
+          escalationId: escalation.escalationId,
+          clientName,
+          reusedEscalation: escalation.reused,
+          clientQuestion: userText,
+          agentReply: replyText,
+          replyMessageId,
+        },
+      });
+    } catch (error) {
+      console.error('[AI] Failed to escalate unresolved delegated client question', {
+        appointmentId,
+        caregiverId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   // Persist delegation question progress so we do not keep asking repeats.
   const askedIndexThisTurn =
     delegatedNextQuestion && forcedQuestion === delegatedNextQuestion
@@ -1510,55 +1863,15 @@ async function runCaregiverAgent(
     delegation?.progressNotifiedIndexes,
     questions.length,
   );
-  const previousProgressNotifiedSet = new Set<number>(previousProgressNotifiedIndexes);
-  const newlyResolvedPrimaryIndexes = requiredResolvedIndexList.filter((idx) => !previousProgressNotifiedSet.has(idx));
   const shouldNotifyProgress =
+    false &&
     DELEGATION_PROGRESS_NOTIFY_V1 &&
     delegationActive &&
     !delegationIsSystemManaged &&
-    !completionReady &&
-    newlyResolvedPrimaryIndexes.length > 0;
+    !completionReady;
 
   if (shouldNotifyProgress) {
-    const progressMessage = formatDelegationProgressUpdate({
-      clientName,
-      questions,
-      newlyResolvedIndexes: newlyResolvedPrimaryIndexes,
-      unresolvedRequiredIndexes: unresolvedRequiredIndexList,
-      latestClientMessage: userText,
-    });
-    const dedupeKey = buildDelegationProgressDedupeKey({
-      appointmentId,
-      startedAt: String(delegation?.startedAt || ''),
-      resolvedPrimaryIndexes: requiredResolvedIndexList,
-    });
-    try {
-      progressMessageId = await appendAgentDeskDelegationUpdateMessage({
-        pool,
-        caregiverId,
-        appointmentId,
-        content: progressMessage,
-        source: 'DELEGATION_PROGRESS',
-        dedupeKey,
-        metadata: {
-          appointmentId,
-          caregiverId,
-          clientName,
-          latestClientMessage: userText,
-          newlyResolvedPrimaryIndexes,
-          unresolvedRequiredIndexes: unresolvedRequiredIndexList,
-        },
-      });
-      if (progressMessageId) {
-        progressNotifiedIndexesToPersist = requiredResolvedIndexList;
-      }
-    } catch (error) {
-      console.error('[AI] Failed to write delegation progress update to agent desk', {
-        appointmentId,
-        caregiverId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    progressNotifiedIndexesToPersist = requiredResolvedIndexList;
   }
 
   if (completionReady) {
@@ -1656,6 +1969,15 @@ async function runCaregiverAgent(
       appointmentId,
       caregiverId,
       completionMessageId,
+    });
+  }
+
+  if (delegationEscalationId) {
+    console.log('[AI] Delegation unresolved-question escalation opened', {
+      appointmentId,
+      caregiverId,
+      escalationId: delegationEscalationId,
+      escalationDeskMessageId,
     });
   }
 
@@ -1758,6 +2080,39 @@ async function runCaregiverAgent(
           `Pre-readiness escalation: unresolved items require caregiver follow-up (${failedChecks.join(', ')}). Summary is available in Agent Desk.`,
         ],
       );
+
+      try {
+        const escalation = await openOrReusePrecheckCriticalFailEscalation({
+          pool,
+          caregiverId,
+          appointmentId,
+          clientName,
+          failedChecks,
+          precheckSummary,
+        });
+        if (!escalation.reused) {
+          await appendSchedulerThreadSystemMessage({
+            pool,
+            caregiverId,
+            escalationId: escalation.escalationId,
+            content: `Precheck critical fail for ${clientName}: ${failedChecks.join(', ')}. Review readiness and coordinate follow-up.`,
+            metadata: {
+              eventType: 'PRECHECK_CRITICAL_ESCALATION_OPENED',
+              appointmentId,
+              caregiverId,
+              clientName,
+              failedChecks,
+            },
+          });
+        }
+      } catch (error) {
+        console.error('[AI] Failed to notify scheduler thread for precheck critical fail', {
+          appointmentId,
+          caregiverId,
+          failedChecks,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     await pool.query(

@@ -5,7 +5,7 @@ import crypto from 'crypto';
 import { loadConfig } from './config';
 import { initializeDatabase, testConnection } from './db';
 import { initializeSQS, publishMessage } from './sqs';
-import { QUEUES } from '@ar/types';
+import { QUEUES, resolvePrecheckProfile, type NotificationJob, type PrecheckCheckType } from '@ar/types';
 import {
   buildScheduleOverviewResponse as buildScheduleOverviewResponsePolicy,
   clampAppointmentIdsByLimit,
@@ -69,6 +69,9 @@ type DelegationEntry = {
   endedAt?: string;
   summary?: string;
   summaryGeneratedAt?: string;
+  source?: string;
+  systemManaged?: boolean;
+  precheckProfileId?: string;
 };
 
 type DelegationSummaryRecord = {
@@ -143,6 +146,9 @@ type StartDelegationResult =
       ok: true;
       delegation: DelegationEntry;
       firstQuestion: string | null;
+      reusedExisting?: boolean;
+      appendedQuestionCount?: number;
+      newlyAskedQuestions?: string[];
     }
   | {
       ok: false;
@@ -187,6 +193,60 @@ type AgentDeskMessageRow = {
   createdAt: string;
 };
 
+type EscalationCategory =
+  | 'CLIENT_QUESTION_NEEDS_CAREGIVER'
+  | 'CAREGIVER_REQUESTS_SCHEDULER'
+  | 'PRECHECK_CRITICAL_FAIL';
+
+type EscalationPriority = 'HIGH';
+
+type EscalationStatus =
+  | 'OPEN'
+  | 'ACKNOWLEDGED'
+  | 'ACTION_REQUESTED'
+  | 'RESOLVED'
+  | 'HANDOFF_TO_CAREGIVER'
+  | 'AUTO_CLOSED';
+
+type EscalationSource = 'AGENT_DESK' | 'DELEGATED_CHAT' | 'PRECHECK_AUTOMATION' | 'SYSTEM';
+
+type EscalationResolutionType = 'ANSWER_RELAYED' | 'CAREGIVER_HANDOFF' | 'SCHEDULER_RESOLVED' | 'NO_ACTION';
+
+type EscalationRow = {
+  id: string;
+  caregiverId: string;
+  appointmentId?: string;
+  delegationId?: string;
+  source: EscalationSource;
+  category: EscalationCategory;
+  priority: EscalationPriority;
+  status: EscalationStatus;
+  summary: string;
+  context: Record<string, unknown>;
+  openedBy: string;
+  resolvedBy?: string;
+  resolutionType?: string;
+  openedAt: string;
+  acknowledgedAt?: string;
+  resolvedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SchedulerThreadActorType = 'CAREGIVER' | 'COORDINATOR' | 'SYSTEM' | 'AI_AGENT';
+
+type SchedulerThreadMessageRow = {
+  id: string;
+  threadId: string;
+  caregiverId: string;
+  senderType: SchedulerThreadActorType;
+  senderId?: string;
+  content: string;
+  escalationId?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+};
+
 type AssistantPendingState = {
   kind:
     | 'MAPS_HOME_ADDRESS'
@@ -196,6 +256,7 @@ type AssistantPendingState = {
     | 'DELEGATION_CONTACT_CONFIRM';
   tool: 'MAPS_ROUTE' | 'CLIENT_INFO' | 'START_DELEGATION';
   baseCommand: string;
+  clarifications?: string[];
   requestedAppointmentId?: string;
   createdAt: string;
 };
@@ -203,6 +264,8 @@ type AssistantPendingState = {
 type AssistantMemoryState = {
   clientId?: string;
   clientName?: string;
+  lastReferencedClientId?: string;
+  lastReferencedClientName?: string;
   appointmentId?: string;
   businessDateHint?: string;
 };
@@ -273,6 +336,37 @@ const READINESS_CHECKS = [
   { key: 'VISIT_BRIEF_READY', critical: false, description: 'Visit brief is prepared.' },
 ];
 const CRITICAL_CHECK_KEYS = new Set(READINESS_CHECKS.filter((c) => c.critical).map((c) => c.key));
+const PRECHECK_CRITICAL_CHECK_ORDER: PrecheckCheckType[] = [
+  'ACCESS_CONFIRMED',
+  'MEDS_SUPPLIES_READY',
+  'CARE_PLAN_CURRENT',
+];
+const ESCALATION_CATEGORIES = new Set<EscalationCategory>([
+  'CLIENT_QUESTION_NEEDS_CAREGIVER',
+  'CAREGIVER_REQUESTS_SCHEDULER',
+  'PRECHECK_CRITICAL_FAIL',
+]);
+const ESCALATION_STATUSES = new Set<EscalationStatus>([
+  'OPEN',
+  'ACKNOWLEDGED',
+  'ACTION_REQUESTED',
+  'RESOLVED',
+  'HANDOFF_TO_CAREGIVER',
+  'AUTO_CLOSED',
+]);
+const ESCALATION_SOURCES = new Set<EscalationSource>([
+  'AGENT_DESK',
+  'DELEGATED_CHAT',
+  'PRECHECK_AUTOMATION',
+  'SYSTEM',
+]);
+const ESCALATION_RESOLUTION_TYPES = new Set<EscalationResolutionType>([
+  'ANSWER_RELAYED',
+  'CAREGIVER_HANDOFF',
+  'SCHEDULER_RESOLVED',
+  'NO_ACTION',
+]);
+const PENDING_CLARIFICATION_MAX_ITEMS = 4;
 const BUSINESS_TIME_ZONE = 'America/Los_Angeles';
 const SQL_APPOINTMENT_BUSINESS_DATE = `(a.start_time AT TIME ZONE '${BUSINESS_TIME_ZONE}')::date`;
 const SQL_START_TIME_BUSINESS_DATE = `(start_time AT TIME ZONE '${BUSINESS_TIME_ZONE}')::date`;
@@ -280,6 +374,27 @@ const CLIENT_LOOKUP_DEFAULT_APPOINTMENT_LIMIT = 20;
 const CLIENT_LOOKUP_DEFAULT_MESSAGE_LIMIT = 400;
 const CLIENT_LOOKUP_DEFAULT_SNIPPET_LIMIT = 4;
 const CLIENT_LOOKUP_LLM_CANDIDATE_LIMIT = 120;
+const LOCAL_COORDINATOR_FALLBACK_RAW = String(process.env.ALLOW_LOCAL_COORDINATOR_FALLBACK || '').trim().toLowerCase();
+const LOCAL_COORDINATOR_FALLBACK_ENABLED = LOCAL_COORDINATOR_FALLBACK_RAW
+  ? ['1', 'true', 'yes'].includes(LOCAL_COORDINATOR_FALLBACK_RAW)
+  : process.env.NODE_ENV !== 'production';
+const LOCAL_COORDINATOR_USERNAME = String(process.env.LOCAL_COORDINATOR_USERNAME || 'scheduler-local').trim() || 'scheduler-local';
+const LOCAL_COORDINATOR_PASSWORD = String(process.env.LOCAL_COORDINATOR_PASSWORD || 'demo123');
+const LOCAL_COORDINATOR_USER_ID_CANDIDATE =
+  String(process.env.LOCAL_COORDINATOR_USER_ID || '00000000-0000-0000-0000-000000000004').trim() ||
+  '00000000-0000-0000-0000-000000000004';
+const LOCAL_COORDINATOR_USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+  LOCAL_COORDINATOR_USER_ID_CANDIDATE,
+)
+  ? LOCAL_COORDINATOR_USER_ID_CANDIDATE
+  : '00000000-0000-0000-0000-000000000004';
+const LOCAL_COORDINATOR_DISPLAY_NAME =
+  String(process.env.LOCAL_COORDINATOR_DISPLAY_NAME || 'Scheduler').trim() || 'Scheduler';
+
+function isSystemManagedDelegationEntry(entry: DelegationEntry | null | undefined): boolean {
+  if (!entry) return false;
+  return entry.systemManaged === true || String(entry.source || '').toUpperCase() === 'PRECHECK_AUTOMATION';
+}
 
 async function main() {
   console.log('[STARTUP] 🚀 Initializing Service...');
@@ -304,7 +419,7 @@ async function main() {
       "Access-Control-Allow-Headers",
       "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Twilio-Signature",
     );
-    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
     next();
   });
 
@@ -421,27 +536,196 @@ async function main() {
   }
 
   function isWhatsAppAllowlisted(endpoint: string): boolean {
-    if (!config.whatsapp.trialMode) return true;
+    if (!config.whatsapp.trialMode && config.whatsapp.allowlistNumbers.length === 0) return true;
     if (config.whatsapp.allowlistNumbers.length === 0) return true;
     const allowlist = new Set(config.whatsapp.allowlistNumbers.map((item) => normalizeWhatsAppEndpoint(item)).filter(Boolean));
     return allowlist.has(endpoint);
   }
 
-  async function resolveClientIdByWhatsAppEndpoint(endpoint: string): Promise<string | null> {
+  function metric(name: string, fields: Record<string, unknown>): void {
+    console.log('[METRIC]', JSON.stringify({ scope: 'whatsapp', name, ...fields }));
+  }
+
+  const WHATSAPP_KICKOFF_SUPPRESS_MINUTES = 60;
+
+  function redactPhoneForLogs(endpoint: string): string {
+    const normalized = normalizeWhatsAppEndpoint(endpoint);
+    if (!config.whatsapp.redactLogs) return normalized || String(endpoint || '');
+    if (!normalized) return 'unknown';
+    return `${normalized.slice(0, 3)}***${normalized.slice(-2)}`;
+  }
+
+  type WhatsAppEndpointBinding = {
+    clientId: string;
+    verified: boolean;
+    active: boolean;
+    blocked: boolean;
+    metadata: Record<string, unknown>;
+  };
+
+  async function resolveWhatsAppEndpointBinding(endpoint: string): Promise<WhatsAppEndpointBinding | null> {
     const result = await pool.query(
       `
-        SELECT entity_id::text AS entity_id
+        SELECT
+          entity_id::text AS entity_id,
+          verified,
+          active,
+          metadata
         FROM channel_endpoints
         WHERE provider = 'twilio_whatsapp'
           AND endpoint = $1
           AND entity_type = 'CLIENT'
-          AND active = true
-        ORDER BY verified DESC, updated_at DESC
+        ORDER BY updated_at DESC
         LIMIT 1
       `,
       [endpoint],
     );
-    return result.rows[0]?.entity_id ? String(result.rows[0].entity_id) : null;
+    if (!result.rows[0]?.entity_id) return null;
+    const metadata = (result.rows[0].metadata || {}) as Record<string, unknown>;
+    const blockedRaw = String(metadata.blocked || '').trim().toLowerCase();
+    const blocked = blockedRaw === '1' || blockedRaw === 'true' || blockedRaw === 'yes';
+    return {
+      clientId: String(result.rows[0].entity_id || ''),
+      verified: Boolean(result.rows[0].verified),
+      active: Boolean(result.rows[0].active),
+      blocked,
+      metadata,
+    };
+  }
+
+  async function isRateLimitedEndpoint(endpoint: string): Promise<boolean> {
+    const limit = config.whatsapp.rateLimitPerEndpoint;
+    if (!Number.isFinite(limit) || limit <= 0) return false;
+    const result = await pool.query(
+      `
+        SELECT COUNT(*)::int AS recent_count
+        FROM webhook_inbox_events
+        WHERE provider = 'twilio_whatsapp'
+          AND created_at >= NOW() - INTERVAL '1 minute'
+          AND COALESCE(payload->>'fromEndpoint', '') = $1
+      `,
+      [endpoint],
+    );
+    const recentCount = Number(result.rows[0]?.recent_count || 0);
+    return recentCount >= limit;
+  }
+
+  async function resolvePrimaryVerifiedWhatsAppEndpointForClient(clientId: string): Promise<string | null> {
+    const endpointRes = await pool.query(
+      `
+        SELECT endpoint
+        FROM channel_endpoints
+        WHERE provider = 'twilio_whatsapp'
+          AND entity_type = 'CLIENT'
+          AND entity_id = $1::uuid
+          AND active = true
+          AND verified = true
+          AND COALESCE(metadata->>'blocked', 'false') NOT IN ('true', '1', 'yes')
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `,
+      [clientId],
+    );
+    return endpointRes.rows[0]?.endpoint ? String(endpointRes.rows[0].endpoint) : null;
+  }
+
+  async function fanoutKickoffToWhatsApp(input: {
+    appointmentId: string;
+    clientId: string;
+    kickoffType: 'DELEGATION' | 'PRECHECK';
+    kickoffMessage: string;
+  }): Promise<void> {
+    if (!config.whatsapp.enabled) return;
+
+    const toEndpoint = await resolvePrimaryVerifiedWhatsAppEndpointForClient(input.clientId);
+    if (!toEndpoint) return;
+
+    const normalizedMessage = input.kickoffMessage.trim().toLowerCase();
+    const hash = crypto.createHash('sha1').update(normalizedMessage).digest('hex').slice(0, 16);
+    const bucket = Math.floor(Date.now() / (WHATSAPP_KICKOFF_SUPPRESS_MINUTES * 60 * 1000));
+    const dedupeKey = `${input.kickoffType}:${input.appointmentId}:${toEndpoint}:${hash}:${bucket}`;
+
+    const dedupeInsert = await pool.query(
+      `
+        INSERT INTO webhook_inbox_events (
+          provider,
+          provider_message_id,
+          event_type,
+          status,
+          payload
+        )
+        VALUES ($1, $2, 'OUTBOUND', 'QUEUED', $3::jsonb)
+        ON CONFLICT (provider, provider_message_id) DO NOTHING
+        RETURNING id
+      `,
+      [
+        'twilio_whatsapp_kickoff',
+        dedupeKey,
+        JSON.stringify({
+          appointmentId: input.appointmentId,
+          toEndpoint,
+          kickoffType: input.kickoffType,
+        }),
+      ],
+    );
+    if (dedupeInsert.rows.length === 0) return;
+
+    const notification: NotificationJob = {
+      type: 'WHATSAPP',
+      recipient: toEndpoint,
+      templateId: 'WHATSAPP_KICKOFF',
+      data: {
+        appointmentId: input.appointmentId,
+        replyText: input.kickoffMessage,
+        kickoffType: input.kickoffType,
+      },
+      correlationId: dedupeKey,
+      provider: 'TWILIO_WHATSAPP',
+      fromEndpoint: config.whatsapp.twilioWhatsAppFrom || undefined,
+      toEndpoint,
+      conversationRef: input.appointmentId,
+    };
+
+    try {
+      await publishMessage(sqsClient, QUEUES.NOTIFICATION, notification);
+      await pool.query(
+        `
+          UPDATE webhook_inbox_events
+          SET status = 'DISPATCHED',
+              processed_at = NOW()
+          WHERE provider = $1 AND provider_message_id = $2
+        `,
+        ['twilio_whatsapp_kickoff', dedupeKey],
+      );
+      metric('kickoff_fanout_dispatched', {
+        kickoffType: input.kickoffType,
+        toEndpoint: redactPhoneForLogs(toEndpoint),
+      });
+    } catch (error) {
+      await pool.query(
+        `
+          UPDATE webhook_inbox_events
+          SET status = 'FAILED_PROCESSING_RETRYABLE',
+              payload = payload || $3::jsonb,
+              processed_at = NOW()
+          WHERE provider = $1 AND provider_message_id = $2
+        `,
+        [
+          'twilio_whatsapp_kickoff',
+          dedupeKey,
+          JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
+        ],
+      );
+      metric('kickoff_fanout_failed', {
+        kickoffType: input.kickoffType,
+        toEndpoint: redactPhoneForLogs(toEndpoint),
+      });
+      console.warn('[WHATSAPP] Kickoff fanout failed (non-blocking)', {
+        appointmentId: input.appointmentId,
+        kickoffType: input.kickoffType,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async function resolveOperationalAppointmentForClient(clientId: string): Promise<AppointmentScopeRow | null> {
@@ -495,6 +779,88 @@ async function main() {
       return null;
     }
     return sessionUser;
+  }
+
+  function authorizeCoordinatorAccess(req: Request, res: Response): SessionUser | null {
+    const sessionUser = getSessionUser(req);
+    if (!sessionUser) {
+      res.status(401).json({ error: 'Authentication required' });
+      return null;
+    }
+    if (sessionUser.role !== 'COORDINATOR') {
+      res.status(403).json({ error: 'Only coordinators can access this endpoint' });
+      return null;
+    }
+    return sessionUser;
+  }
+
+  function authorizeSchedulerThreadAccess(req: Request, res: Response, caregiverId: string): SessionUser | null {
+    const sessionUser = getSessionUser(req);
+    if (!sessionUser) {
+      res.status(401).json({ error: 'Authentication required' });
+      return null;
+    }
+    if (sessionUser.role === 'COORDINATOR') return sessionUser;
+    if (sessionUser.role !== 'CAREGIVER') {
+      res.status(403).json({ error: 'Only caregivers or coordinators can access scheduler threads' });
+      return null;
+    }
+    if (sessionUser.userId !== caregiverId) {
+      res.status(403).json({ error: 'Caregivers can only access their own scheduler thread' });
+      return null;
+    }
+    return sessionUser;
+  }
+
+  function mapEscalationRow(row: any): EscalationRow {
+    return {
+      id: String(row.id || ''),
+      caregiverId: String(row.caregiver_id || ''),
+      appointmentId: normalizeOptionalUuid(row.appointment_id),
+      delegationId: String(row.delegation_id || '').trim() || undefined,
+      source: String(row.source || 'AGENT_DESK').toUpperCase() as EscalationSource,
+      category: String(row.category || 'CAREGIVER_REQUESTS_SCHEDULER').toUpperCase() as EscalationCategory,
+      priority: 'HIGH',
+      status: String(row.status || 'OPEN').toUpperCase() as EscalationStatus,
+      summary: String(row.summary || ''),
+      context: (row.context_json || {}) as Record<string, unknown>,
+      openedBy: String(row.opened_by || ''),
+      resolvedBy: String(row.resolved_by || '').trim() || undefined,
+      resolutionType: String(row.resolution_type || '').trim() || undefined,
+      openedAt: String(row.opened_at || ''),
+      acknowledgedAt: String(row.acknowledged_at || '').trim() || undefined,
+      resolvedAt: String(row.resolved_at || '').trim() || undefined,
+      createdAt: String(row.created_at || ''),
+      updatedAt: String(row.updated_at || ''),
+    };
+  }
+
+  function mapSchedulerThreadMessageRow(row: any): SchedulerThreadMessageRow {
+    return {
+      id: String(row.id || ''),
+      threadId: String(row.thread_id || ''),
+      caregiverId: String(row.caregiver_id || ''),
+      senderType: String(row.sender_type || 'SYSTEM').toUpperCase() as SchedulerThreadActorType,
+      senderId: String(row.sender_id || '').trim() || undefined,
+      content: String(row.content || ''),
+      escalationId: normalizeOptionalUuid(row.escalation_id),
+      metadata: (row.metadata_json || {}) as Record<string, unknown>,
+      createdAt: String(row.created_at || ''),
+    };
+  }
+
+  function canTransitionEscalationStatus(from: EscalationStatus, to: EscalationStatus): boolean {
+    if (from === to) return true;
+    if (from === 'OPEN') {
+      return ['ACKNOWLEDGED', 'RESOLVED', 'HANDOFF_TO_CAREGIVER', 'AUTO_CLOSED'].includes(to);
+    }
+    if (from === 'ACKNOWLEDGED') {
+      return ['ACTION_REQUESTED', 'RESOLVED', 'HANDOFF_TO_CAREGIVER', 'AUTO_CLOSED'].includes(to);
+    }
+    if (from === 'ACTION_REQUESTED') {
+      return ['RESOLVED', 'HANDOFF_TO_CAREGIVER'].includes(to);
+    }
+    return false;
   }
 
   async function getAgentSettings(userId: string): Promise<{ settings: AgentPersonaSettings; role: string; version: number }> {
@@ -820,6 +1186,143 @@ async function main() {
     }
   }
 
+  async function ensureSchedulerThread(caregiverId: string): Promise<string> {
+    const existing = await pool.query(
+      `
+        SELECT id::text
+        FROM scheduler_threads
+        WHERE caregiver_id = $1
+        LIMIT 1
+      `,
+      [caregiverId],
+    );
+    if (existing.rows.length > 0) {
+      return String(existing.rows[0].id || '');
+    }
+
+    const inserted = await pool.query(
+      `
+        INSERT INTO scheduler_threads (caregiver_id, active, updated_at)
+        VALUES ($1, true, NOW())
+        ON CONFLICT (caregiver_id)
+        DO UPDATE SET
+          active = true,
+          updated_at = NOW()
+        RETURNING id::text
+      `,
+      [caregiverId],
+    );
+    return String(inserted.rows[0].id || '');
+  }
+
+  async function appendSchedulerThreadMessage(input: {
+    caregiverId: string;
+    senderType: SchedulerThreadActorType;
+    senderId?: string;
+    content: string;
+    escalationId?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<SchedulerThreadMessageRow> {
+    const content = String(input.content || '').trim();
+    if (!content) {
+      throw new Error('Scheduler thread message content is required');
+    }
+
+    const threadId = await ensureSchedulerThread(input.caregiverId);
+    const escalationId = normalizeOptionalUuid(input.escalationId);
+    const metadata = input.metadata || {};
+    const senderId = String(input.senderId || '').trim() || null;
+
+    const result = await pool.query(
+      `
+        INSERT INTO scheduler_thread_messages (
+          thread_id,
+          sender_type,
+          sender_id,
+          content,
+          escalation_id,
+          metadata_json
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5::uuid, $6::jsonb)
+        RETURNING
+          id::text,
+          thread_id::text,
+          sender_type,
+          COALESCE(sender_id::text, '') AS sender_id,
+          content,
+          COALESCE(escalation_id::text, '') AS escalation_id,
+          metadata_json,
+          created_at::text
+      `,
+      [threadId, input.senderType, senderId, content, escalationId || null, JSON.stringify(metadata)],
+    );
+
+    await pool.query(
+      `
+        UPDATE scheduler_threads
+        SET updated_at = NOW()
+        WHERE id = $1::uuid
+      `,
+      [threadId],
+    );
+
+    return mapSchedulerThreadMessageRow({
+      ...result.rows[0],
+      caregiver_id: input.caregiverId,
+    });
+  }
+
+  async function listSchedulerThreadMessages(input: {
+    caregiverId: string;
+    limit: number;
+    before?: string;
+  }): Promise<{ threadId: string; messages: SchedulerThreadMessageRow[] }> {
+    const threadId = await ensureSchedulerThread(input.caregiverId);
+    const beforeIso = String(input.before || '').trim();
+    const params = beforeIso ? [threadId, input.limit, beforeIso] : [threadId, input.limit];
+    const query = beforeIso
+      ? `
+          SELECT
+            m.id::text,
+            m.thread_id::text,
+            t.caregiver_id::text AS caregiver_id,
+            m.sender_type,
+            COALESCE(m.sender_id::text, '') AS sender_id,
+            m.content,
+            COALESCE(m.escalation_id::text, '') AS escalation_id,
+            m.metadata_json,
+            m.created_at::text
+          FROM scheduler_thread_messages m
+          INNER JOIN scheduler_threads t ON t.id = m.thread_id
+          WHERE m.thread_id = $1::uuid
+            AND m.created_at < $3::timestamptz
+          ORDER BY m.created_at DESC
+          LIMIT $2::int
+        `
+      : `
+          SELECT
+            m.id::text,
+            m.thread_id::text,
+            t.caregiver_id::text AS caregiver_id,
+            m.sender_type,
+            COALESCE(m.sender_id::text, '') AS sender_id,
+            m.content,
+            COALESCE(m.escalation_id::text, '') AS escalation_id,
+            m.metadata_json,
+            m.created_at::text
+          FROM scheduler_thread_messages m
+          INNER JOIN scheduler_threads t ON t.id = m.thread_id
+          WHERE m.thread_id = $1::uuid
+          ORDER BY m.created_at DESC
+          LIMIT $2::int
+        `;
+    const result = await pool.query(query, params);
+    return {
+      threadId,
+      messages: result.rows.map((row) => mapSchedulerThreadMessageRow(row)),
+    };
+  }
+
   function listLegacyAgentDeskMessagesFromAssistantHistory(input: {
     caregiverId: string;
     assistantHistory: AssistantTurn[];
@@ -904,6 +1407,13 @@ async function main() {
       'DELEGATION_CONTACT_CONFIRM',
     ]);
     const validPendingTools = new Set(['MAPS_ROUTE', 'CLIENT_INFO', 'START_DELEGATION']);
+    const normalizePendingClarifications = (raw: unknown): string[] => {
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .map((value) => String(value || '').trim())
+        .filter((value) => value.length > 0)
+        .slice(-PENDING_CLARIFICATION_MAX_ITEMS);
+    };
     const pending =
       pendingRaw &&
       validPendingKinds.has(String(pendingRaw.kind || '')) &&
@@ -913,6 +1423,7 @@ async function main() {
             kind: String(pendingRaw.kind) as AssistantPendingState['kind'],
             tool: String(pendingRaw.tool) as AssistantPendingState['tool'],
             baseCommand: String(pendingRaw.baseCommand || '').trim(),
+            clarifications: normalizePendingClarifications((pendingRaw as any).clarifications),
             requestedAppointmentId: pendingRaw.requestedAppointmentId ? String(pendingRaw.requestedAppointmentId) : undefined,
             createdAt: String(pendingRaw.createdAt || new Date().toISOString()),
           }
@@ -922,6 +1433,8 @@ async function main() {
     const memory: AssistantMemoryState = {
       clientId: memoryRaw.clientId ? String(memoryRaw.clientId) : undefined,
       clientName: memoryRaw.clientName ? String(memoryRaw.clientName) : undefined,
+      lastReferencedClientId: memoryRaw.lastReferencedClientId ? String(memoryRaw.lastReferencedClientId) : undefined,
+      lastReferencedClientName: memoryRaw.lastReferencedClientName ? String(memoryRaw.lastReferencedClientName) : undefined,
       appointmentId: memoryRaw.appointmentId ? String(memoryRaw.appointmentId) : undefined,
       businessDateHint: memoryRaw.businessDateHint ? String(memoryRaw.businessDateHint) : undefined,
     };
@@ -956,11 +1469,39 @@ async function main() {
     state: AgentAssistantState,
     pending: Omit<AssistantPendingState, 'createdAt'>,
   ): AgentAssistantState {
+    const normalizedClarifications = Array.isArray(pending.clarifications)
+      ? pending.clarifications
+          .map((value) => String(value || '').trim())
+          .filter((value) => value.length > 0)
+          .slice(-PENDING_CLARIFICATION_MAX_ITEMS)
+      : state.pending && state.pending.baseCommand === pending.baseCommand
+        ? (state.pending.clarifications || []).slice(-PENDING_CLARIFICATION_MAX_ITEMS)
+        : [];
     return {
       ...state,
       pending: {
         ...pending,
+        clarifications: normalizedClarifications,
         createdAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  function pushPendingClarification(state: AgentAssistantState, clarification: string): AgentAssistantState {
+    if (!state.pending) return state;
+    const trimmed = String(clarification || '').trim();
+    if (!trimmed) return state;
+    const current = (state.pending.clarifications || [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => value.length > 0);
+    if (current[current.length - 1] === trimmed) {
+      return state;
+    }
+    return {
+      ...state,
+      pending: {
+        ...state.pending,
+        clarifications: [...current, trimmed].slice(-PENDING_CLARIFICATION_MAX_ITEMS),
       },
     };
   }
@@ -984,6 +1525,8 @@ async function main() {
         ...(state.memory || {}),
         clientId: appointment.clientId,
         clientName: appointment.clientName,
+        lastReferencedClientId: appointment.clientId,
+        lastReferencedClientName: appointment.clientName,
         appointmentId: appointment.appointmentId,
         businessDateHint: businessDateHint || state.memory?.businessDateHint,
       },
@@ -1002,6 +1545,8 @@ async function main() {
         ...(state.memory || {}),
         clientId: resolved.clientId,
         clientName: resolved.clientName,
+        lastReferencedClientId: resolved.clientId,
+        lastReferencedClientName: resolved.clientName,
         appointmentId: resolved.appointmentId,
         businessDateHint: businessDateHint || state.memory?.businessDateHint,
       },
@@ -1031,7 +1576,21 @@ async function main() {
     mergeWithPending: boolean,
   ): string {
     if (!state.pending || !mergeWithPending) return command;
-    return `${state.pending.baseCommand}\nLatest caregiver clarification (if any detail conflicts with earlier text, prioritize this clarification): ${command}`;
+    const priorClarifications = (state.pending.clarifications || [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => value.length > 0);
+    const sections = [state.pending.baseCommand];
+    if (priorClarifications.length > 0) {
+      sections.push(
+        `Prior caregiver clarifications:\n${priorClarifications
+          .map((value, index) => `${index + 1}. ${value}`)
+          .join('\n')}`,
+      );
+    }
+    sections.push(
+      `Latest caregiver clarification (if any detail conflicts with earlier text, prioritize this clarification): ${command}`,
+    );
+    return sections.join('\n\n');
   }
 
   async function analyzeCaregiverTurnWithLLM(input: {
@@ -1258,14 +1817,44 @@ Return:
   function looksLikeClientFactQuestion(command: string): boolean {
     const normalized = normalizeCommandText(command);
     if (!normalized) return false;
+    const scheduleLike = /\b(schedule|appointments|visits?|shift|day|tomorrow|today|yesterday)\b/.test(normalized);
+    const mapsLike = /\b(route|routes|map|maps|drive|driving|traffic|travel|eta)\b/.test(normalized);
+    if (scheduleLike || mapsLike) return false;
     const personRef =
       /\b(client|family|parent|guardian|patient|him|her|them)\b/.test(normalized) ||
-      /\b[a-z][a-z'-]{1,}'s\b/.test(normalized) ||
-      /\b(?:does|did|is|has|have)\s+[a-z][a-z'-]{1,}\b/.test(normalized);
+      /\b[a-z][a-z'-]{1,}'s\b/.test(normalized);
     const factCue =
-      /\b(fridge|refrigerator|food|house|home|advil|ibuprofen|med|medicine|supplies|dog|pet|access|code)\b/.test(normalized) ||
-      /\b(does|is|has|have)\b/.test(normalized);
-    return personRef && factCue;
+      /\b(fridge|refrigerator|food|banana|bananas|house|home|advil|ibuprofen|med|medicine|supplies|dog|pet|access|code|likes?|prefer|favorite|allerg|scared|afraid|enjoy|sport|sports)\b/.test(normalized) ||
+      /\b(what does .* like|what does .* enjoy)\b/.test(normalized);
+    return factCue && (personRef || /\b(does|did|is|has|have)\b/.test(normalized));
+  }
+
+  function hasClientReferenceCue(input: {
+    command: string;
+    assistantState: AgentAssistantState;
+    requestedAppointmentId?: string;
+    appointments: CaregiverAppointmentRow[];
+  }): boolean {
+    const normalized = normalizeCommandText(input.command);
+    if (!normalized) return false;
+    if (String(input.requestedAppointmentId || '').trim()) return true;
+    if (Boolean(input.assistantState.memory?.appointmentId)) return true;
+    if (Boolean(input.assistantState.memory?.clientName || input.assistantState.memory?.lastReferencedClientName)) return true;
+    if (Boolean(extractClientHint(input.command))) return true;
+    if (Boolean(extractClientHintFromKnownAppointments(input.command, input.appointments))) return true;
+    return /\b(he|she|him|her|his|hers|they|them|their|the client|the patient)\b/.test(normalized);
+  }
+
+  function shouldForceClientInfoFromContext(input: {
+    command: string;
+    assistantState: AgentAssistantState;
+    appointments: CaregiverAppointmentRow[];
+    requestedAppointmentId?: string;
+  }): boolean {
+    if (!looksLikeClientFactQuestion(input.command)) return false;
+    if (!hasClientReferenceCue(input)) return false;
+    if (hasExplicitDelegationDirective(input.command)) return false;
+    return true;
   }
 
   function buildDelegationContactConfirmationPrompt(knownInfoPrefix?: string): string {
@@ -1497,6 +2086,8 @@ Return:
     command: string;
     turnSignals: CaregiverTurnSignals;
     assistantState: AgentAssistantState;
+    appointments?: CaregiverAppointmentRow[];
+    requestedAppointmentId?: string;
   }): AssistantPlannerDecision | null {
     const normalized = normalizeCommandText(input.command);
     if (!normalized) return null;
@@ -1511,7 +2102,15 @@ Return:
       /\b(access code|history|what did|what has|said about|notes|client info|family said|care plan update|meds update)\b/.test(
         normalized,
       ) ||
-      /\b(access)\b/.test(normalized);
+      /\b(access)\b/.test(normalized) ||
+      (Array.isArray(input.appointments)
+        ? shouldForceClientInfoFromContext({
+            command: input.command,
+            assistantState: input.assistantState,
+            appointments: input.appointments,
+            requestedAppointmentId: input.requestedAppointmentId,
+          })
+        : false);
     const delegationIntent = hasDelegationIntent(input.command);
 
     if (mapsIntent) {
@@ -1606,7 +2205,9 @@ Return:
     const tool = String(raw.tool || '')
       .trim()
       .toUpperCase();
-    const normalizedTool: AssistantPlannerTool | undefined = (['SCHEDULE_DAY', 'MAPS_ROUTE', 'CLIENT_INFO', 'START_DELEGATION'] as const).includes(
+    const normalizedTool: AssistantPlannerTool | undefined = (
+      ['SCHEDULE_DAY', 'MAPS_ROUTE', 'CLIENT_INFO', 'START_DELEGATION'] as const
+    ).includes(
       tool as AssistantPlannerTool,
     )
       ? (tool as AssistantPlannerTool)
@@ -2246,6 +2847,20 @@ Index is zero-based. If no question is appropriate, return -1.`,
       const priority = String(item.priority || '').trim().toUpperCase() === 'OPTIONAL' ? 'OPTIONAL' : 'PRIMARY';
       return { text, priority };
     };
+    const normalizeQuestionTextKey = (value: string): string =>
+      String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const normalizeQuestionIndexes = (values: unknown, questionCount: number): number[] => {
+      if (!Array.isArray(values)) return [];
+      return values
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value >= 0 && value < questionCount)
+        .filter((value, index, arr) => arr.indexOf(value) === index)
+        .sort((a, b) => a - b);
+    };
     const questionItemsRaw: DelegationQuestionItem[] = Array.isArray(input.questionItems)
       ? input.questionItems
           .map((row) => normalizeQuestionItem(row))
@@ -2281,7 +2896,7 @@ Index is zero-based. If no question is appropriate, return -1.`,
 
     const apptRes = await pool.query(
       `
-        SELECT id::text
+        SELECT id::text, client_id::text AS client_id
         FROM appointments
         WHERE id = $1::uuid
           AND caregiver_id::text = $2
@@ -2296,6 +2911,7 @@ Index is zero-based. If no question is appropriate, return -1.`,
         error: 'Appointment not found for this caregiver',
       };
     }
+    const appointmentClientId = String(apptRes.rows[0]?.client_id || '').trim();
 
     const checkRes = await pool.query(
       `
@@ -2321,6 +2937,159 @@ Index is zero-based. If no question is appropriate, return -1.`,
     const endsAt = new Date(now.getTime() + duration * 60 * 1000);
     const { settings, role } = await getAgentSettings(input.userId);
     const delegations = settings.delegations || {};
+    const existingDelegation = delegations[appointmentId];
+
+    const existingEndsAtMs = Date.parse(String(existingDelegation?.endsAt || ''));
+    const hasUnexpiredExisting = Boolean(existingDelegation?.active) && Number.isFinite(existingEndsAtMs) && existingEndsAtMs > now.getTime();
+
+    if (hasUnexpiredExisting && !isSystemManagedDelegationEntry(existingDelegation)) {
+      const existingQuestionItemsRaw = Array.isArray(existingDelegation?.questionItems)
+        ? existingDelegation.questionItems
+        : [];
+      const existingQuestionItemsFromItems = existingQuestionItemsRaw
+        .map((row) => normalizeQuestionItem(row))
+        .filter((row): row is DelegationQuestionItem => Boolean(row));
+      const existingQuestionItemsFallback = Array.isArray(existingDelegation?.questions)
+        ? existingDelegation.questions
+            .map((text) => String(text || '').trim())
+            .filter(Boolean)
+            .map((text) => ({ text, priority: 'PRIMARY' as const }))
+        : [];
+      const existingQuestionItems =
+        existingQuestionItemsFromItems.length > 0
+          ? existingQuestionItemsFromItems
+          : existingQuestionItemsFallback;
+      const mergedQuestionItems: DelegationQuestionItem[] = [];
+      const seenQuestionKeys = new Set<string>();
+      for (const item of existingQuestionItems) {
+        mergedQuestionItems.push(item);
+        const key = normalizeQuestionTextKey(item.text);
+        if (key) seenQuestionKeys.add(key);
+      }
+      const addedQuestionIndexes: number[] = [];
+      for (const item of questionItems) {
+        const key = normalizeQuestionTextKey(item.text);
+        if (!key || seenQuestionKeys.has(key)) continue;
+        seenQuestionKeys.add(key);
+        addedQuestionIndexes.push(mergedQuestionItems.length);
+        mergedQuestionItems.push(item);
+      }
+
+      if (addedQuestionIndexes.length === 0) {
+        return {
+          ok: true,
+          delegation: existingDelegation as DelegationEntry,
+          firstQuestion: null,
+          reusedExisting: true,
+          appendedQuestionCount: 0,
+          newlyAskedQuestions: [],
+        };
+      }
+
+      const mergedQuestions = mergedQuestionItems.map((item) => item.text);
+      const mergedPrimaryQuestionIndexes = mergedQuestionItems
+        .map((item, idx) => (item.priority === 'PRIMARY' ? idx : -1))
+        .filter((idx) => idx >= 0);
+      const safeMergedPrimaryQuestionIndexes =
+        mergedPrimaryQuestionIndexes.length > 0
+          ? mergedPrimaryQuestionIndexes
+          : (mergedQuestions.length > 0 ? [0] : []);
+      const mergedOptionalQuestionIndexes = mergedQuestionItems
+        .map((item, idx) => (item.priority === 'OPTIONAL' ? idx : -1))
+        .filter((idx) => idx >= 0);
+      const existingQuestionCount = existingQuestionItems.length;
+      const priorResolved = normalizeQuestionIndexes(existingDelegation?.resolvedQuestionIndexes, existingQuestionCount);
+      const priorAsked = normalizeQuestionIndexes(existingDelegation?.askedQuestionIndexes, existingQuestionCount);
+      const priorProgress = normalizeQuestionIndexes(existingDelegation?.progressNotifiedIndexes, existingQuestionCount);
+      const priorAskedSet = new Set<number>(priorAsked);
+      const priorResolvedSet = new Set<number>(priorResolved);
+      const askableNewIndexes = addedQuestionIndexes.filter(
+        (idx) => !priorAskedSet.has(idx) && !priorResolvedSet.has(idx),
+      );
+      const factCheckCandidates = askableNewIndexes.filter((idx) => safeMergedPrimaryQuestionIndexes.includes(idx));
+      const nextAskedNow =
+        (existingDelegation?.delegationType || delegationType) === 'FACT_CHECK'
+          ? (factCheckCandidates.length > 0 ? factCheckCandidates : askableNewIndexes).slice(0, 2)
+          : askableNewIndexes.slice(0, 1);
+      const nextAskedSet = new Set<number>([...priorAsked, ...nextAskedNow]);
+      const nextAsked = Array.from(nextAskedSet).sort((a, b) => a - b);
+
+      const nextDelegation: DelegationEntry = {
+        ...(existingDelegation as DelegationEntry),
+        active: true,
+        objective: String(existingDelegation?.objective || objective || '').trim(),
+        questions: mergedQuestions,
+        questionItems: mergedQuestionItems,
+        primaryQuestionIndexes: safeMergedPrimaryQuestionIndexes,
+        optionalQuestionIndexes: mergedOptionalQuestionIndexes,
+        resolvedQuestionIndexes: priorResolved,
+        askedQuestionIndexes: nextAsked,
+        progressNotifiedIndexes: priorProgress,
+        completionNotifiedAt: undefined,
+        contextPacket: {
+          ...(existingDelegation?.contextPacket || {}),
+          delegationType: existingDelegation?.delegationType || delegationType,
+          primaryQuestionCount: safeMergedPrimaryQuestionIndexes.length,
+          optionalQuestionCount: mergedOptionalQuestionIndexes.length,
+        },
+      };
+      delegations[appointmentId] = nextDelegation;
+      settings.delegations = delegations;
+      await saveAgentSettings(input.userId, role || 'CAREGIVER', settings, { activateAgent: true });
+
+      if (nextAskedNow.length > 0) {
+        const followUpMessage =
+          nextAskedNow.length > 1
+            ? [
+                'Thanks for the update from your caregiver. I have a couple more quick questions:',
+                ...nextAskedNow.map((idx, offset) => `${offset + 1}) ${mergedQuestions[idx]}`),
+                'Please answer what you know.',
+              ].join('\n')
+            : `Thanks for the update from your caregiver. One more quick question: ${mergedQuestions[nextAskedNow[0]]}`;
+        await pool.query(
+          `
+            INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
+            VALUES ($1, 'AI_AGENT', $2, $3, true)
+          `,
+          [appointmentId, input.userId, followUpMessage],
+        );
+      }
+
+      return {
+        ok: true,
+        delegation: nextDelegation,
+        firstQuestion: nextAskedNow.length > 0 ? mergedQuestions[nextAskedNow[0]] : null,
+        reusedExisting: true,
+        appendedQuestionCount: addedQuestionIndexes.length,
+        newlyAskedQuestions: nextAskedNow.map((idx) => mergedQuestions[idx]).filter(Boolean),
+      };
+    }
+
+    if (hasUnexpiredExisting && isSystemManagedDelegationEntry(existingDelegation)) {
+      try {
+        await pool.query(
+          `
+            INSERT INTO readiness_events (appointment_id, event_type, details)
+            VALUES ($1::uuid, 'PRECHECK_INTERRUPTED', $2::jsonb)
+          `,
+          [
+            appointmentId,
+            JSON.stringify({
+              interruptedAt: now.toISOString(),
+              reason: 'MANUAL_DELEGATION_OVERRIDE',
+              interruptedBy: input.userId,
+              previousPrecheckSource: existingDelegation.source || 'PRECHECK_AUTOMATION',
+            }),
+          ],
+        );
+      } catch (error) {
+        console.warn('[AGENT] Failed to record precheck interruption marker', {
+          appointmentId,
+          caregiverId: input.userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     delegations[appointmentId] = {
       appointmentId,
@@ -2344,6 +3113,9 @@ Index is zero-based. If no question is appropriate, return -1.`,
       },
       startedAt: now.toISOString(),
       endsAt: endsAt.toISOString(),
+      source: 'CAREGIVER_MANUAL',
+      systemManaged: false,
+      precheckProfileId: undefined,
     };
 
     settings.delegations = delegations;
@@ -2386,6 +3158,21 @@ Index is zero-based. If no question is appropriate, return -1.`,
       `,
       [appointmentId, input.userId, kickoffMessage],
     );
+    if (appointmentClientId) {
+      try {
+        await fanoutKickoffToWhatsApp({
+          appointmentId,
+          clientId: appointmentClientId,
+          kickoffType: 'DELEGATION',
+          kickoffMessage,
+        });
+      } catch (error) {
+        console.warn('[WHATSAPP] Delegation kickoff fanout skipped due to non-blocking error', {
+          appointmentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     if (kickoffAskedIndexes.length > 0) {
       delegations[appointmentId].askedQuestionIndexes = kickoffAskedIndexes.slice().sort((a, b) => a - b);
@@ -2398,6 +3185,321 @@ Index is zero-based. If no question is appropriate, return -1.`,
       delegation: delegations[appointmentId],
       firstQuestion,
     };
+  }
+
+  async function maybeResumePrecheckAfterManualCompletion(input: {
+    appointmentId: string;
+    caregiverId: string;
+    manualDelegationStartedAt?: string;
+    manualDelegationEndedAt: string;
+  }): Promise<void> {
+    const appointmentId = String(input.appointmentId || '').trim();
+    if (!appointmentId) return;
+
+    const interruptionRes = await pool.query(
+      `
+        SELECT created_at::text AS created_at
+        FROM readiness_events
+        WHERE appointment_id = $1::uuid
+          AND event_type = 'PRECHECK_INTERRUPTED'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [appointmentId],
+    );
+    if (interruptionRes.rows.length === 0) return;
+
+    const interruptedAt = String(interruptionRes.rows[0]?.created_at || '').trim();
+    if (!interruptedAt) return;
+    const interruptedAtMs = Date.parse(interruptedAt);
+    if (!Number.isFinite(interruptedAtMs)) return;
+
+    const manualStartedAtMs = Date.parse(String(input.manualDelegationStartedAt || ''));
+    if (Number.isFinite(manualStartedAtMs) && manualStartedAtMs + 60_000 < interruptedAtMs) {
+      return;
+    }
+
+    const resumedAfterInterruptionRes = await pool.query(
+      `
+        SELECT 1
+        FROM readiness_events
+        WHERE appointment_id = $1::uuid
+          AND event_type IN ('PRECHECK_RESUMED', 'PRECHECK_COMPLETED')
+          AND created_at > $2::timestamptz
+        LIMIT 1
+      `,
+      [appointmentId, interruptedAt],
+    );
+    if (resumedAfterInterruptionRes.rows.length > 0) return;
+
+    const appointmentRes = await pool.query(
+      `
+        SELECT
+          a.id::text AS appointment_id,
+          a.start_time::text AS start_time,
+          COALESCE(a.aloha_status, 'SCHEDULED') AS appointment_status,
+          a.service_type,
+          c.name AS client_name
+        FROM appointments a
+        LEFT JOIN clients c ON c.id = a.client_id
+        WHERE a.id = $1::uuid
+        LIMIT 1
+      `,
+      [appointmentId],
+    );
+    if (appointmentRes.rows.length === 0) return;
+
+    const appointmentRow = appointmentRes.rows[0];
+    const appointmentStatus = String(appointmentRow.appointment_status || 'SCHEDULED');
+    if (appointmentStatus !== 'SCHEDULED') {
+      return;
+    }
+
+    const criticalChecksRes = await pool.query(
+      `
+        SELECT check_type, status
+        FROM readiness_checks
+        WHERE appointment_id = $1::uuid
+          AND check_type = ANY($2::text[])
+      `,
+      [appointmentId, PRECHECK_CRITICAL_CHECK_ORDER],
+    );
+    const statusByCheck = new Map<PrecheckCheckType, 'PENDING' | 'PASS' | 'FAIL'>();
+    for (const checkType of PRECHECK_CRITICAL_CHECK_ORDER) {
+      statusByCheck.set(checkType, 'PENDING');
+    }
+    for (const row of criticalChecksRes.rows) {
+      const checkType = String(row.check_type || '').trim().toUpperCase() as PrecheckCheckType;
+      if (!statusByCheck.has(checkType)) continue;
+      const statusRaw = String(row.status || '').trim().toUpperCase();
+      const status: 'PENDING' | 'PASS' | 'FAIL' =
+        statusRaw === 'PASS' || statusRaw === 'FAIL' ? statusRaw : 'PENDING';
+      statusByCheck.set(checkType, status);
+    }
+
+    const hasCriticalFail = PRECHECK_CRITICAL_CHECK_ORDER.some((checkType) => statusByCheck.get(checkType) === 'FAIL');
+    const allCriticalPass = PRECHECK_CRITICAL_CHECK_ORDER.every((checkType) => statusByCheck.get(checkType) === 'PASS');
+    if (allCriticalPass) {
+      return;
+    }
+
+    const clientName = String(appointmentRow.client_name || 'there');
+
+    if (hasCriticalFail) {
+      const failedChecks = PRECHECK_CRITICAL_CHECK_ORDER.filter((checkType) => statusByCheck.get(checkType) === 'FAIL');
+      const nowIso = new Date().toISOString();
+      await pool.query(
+        `
+          INSERT INTO readiness_events (appointment_id, event_type, details)
+          VALUES ($1::uuid, 'PRECHECK_ESCALATED', $2::jsonb)
+        `,
+        [
+          appointmentId,
+          JSON.stringify({
+            escalatedAt: nowIso,
+            reason: 'UNRESOLVED_CHECKS_AFTER_MANUAL_DELEGATION',
+            failedChecks,
+            interruptedAt,
+          }),
+        ],
+      );
+      await pool.query(
+        `
+          INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
+          VALUES ($1::uuid, 'SYSTEM', $2, $3, true)
+        `,
+        [
+          appointmentId,
+          input.caregiverId,
+          `Pre-readiness escalation: unresolved critical blockers remain after delegation (${failedChecks.join(', ')}). Caregiver follow-up is required.`,
+        ],
+      );
+      await pool.query(
+        `
+          INSERT INTO readiness_events (appointment_id, event_type, details)
+          SELECT $1::uuid, 'PRECHECK_COMPLETED', $2::jsonb
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM readiness_events
+            WHERE appointment_id = $1::uuid
+              AND event_type = 'PRECHECK_COMPLETED'
+          )
+        `,
+        [
+          appointmentId,
+          JSON.stringify({
+            completedAt: nowIso,
+            outcome: 'ESCALATED',
+            source: 'APPOINTMENT_MANAGEMENT_AFTER_MANUAL_DELEGATION',
+          }),
+        ],
+      );
+      return;
+    }
+
+    const precheckStartedRes = await pool.query(
+      `
+        SELECT created_at::text AS created_at
+        FROM readiness_events
+        WHERE appointment_id = $1::uuid
+          AND event_type = 'PRECHECK_STARTED'
+          AND created_at <= $2::timestamptz
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [appointmentId, interruptedAt],
+    );
+    const priorPrecheckStartedAt = String(precheckStartedRes.rows[0]?.created_at || '').trim();
+    let hadPriorPrecheckResponse = false;
+    if (priorPrecheckStartedAt) {
+      const precheckReplyWindowEnd = String(input.manualDelegationStartedAt || input.manualDelegationEndedAt);
+      const replyRes = await pool.query(
+        `
+          SELECT COUNT(*)::int AS count
+          FROM messages
+          WHERE appointment_id = $1::uuid
+            AND created_at > $2::timestamptz
+            AND created_at < $3::timestamptz
+            AND sender_type IN ('FAMILY', 'COORDINATOR', 'CAREGIVER')
+            AND COALESCE(is_agent, false) = false
+        `,
+        [appointmentId, priorPrecheckStartedAt, precheckReplyWindowEnd],
+      );
+      hadPriorPrecheckResponse = Number(replyRes.rows[0]?.count || 0) > 0;
+    }
+
+    await pool.query(
+      `
+        DELETE FROM readiness_events
+        WHERE appointment_id = $1::uuid
+          AND event_type = 'PRECHECK_COMPLETED'
+      `,
+      [appointmentId],
+    );
+    await pool.query(
+      `
+        INSERT INTO readiness_events (appointment_id, event_type, details)
+        SELECT $1::uuid, 'PRECHECK_STARTED', $2::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM readiness_events
+          WHERE appointment_id = $1::uuid
+            AND event_type = 'PRECHECK_STARTED'
+        )
+      `,
+      [
+        appointmentId,
+        JSON.stringify({
+          startedBy: 'APPOINTMENT_MANAGEMENT_AFTER_MANUAL_DELEGATION',
+          startedAt: new Date().toISOString(),
+        }),
+      ],
+    );
+
+    const serviceType = appointmentRow.service_type ? String(appointmentRow.service_type) : null;
+    const profile = resolvePrecheckProfile(serviceType);
+    const questionByCheck = new Map(profile.questions.map((q) => [q.checkType, q.prompt]));
+    const unresolvedChecks = PRECHECK_CRITICAL_CHECK_ORDER.filter((checkType) => statusByCheck.get(checkType) !== 'PASS');
+    const nextCheckType = hadPriorPrecheckResponse
+      ? (unresolvedChecks[0] || PRECHECK_CRITICAL_CHECK_ORDER[0])
+      : PRECHECK_CRITICAL_CHECK_ORDER[0];
+    const nextQuestion =
+      String(questionByCheck.get(nextCheckType) || '').trim() ||
+      'Can you confirm access and readiness details for this appointment?';
+    const nextQuestionIndex = profile.questions.findIndex((q) => q.checkType === nextCheckType);
+    const safeNextQuestionIndex = nextQuestionIndex >= 0 ? nextQuestionIndex : 0;
+    const restartMode = hadPriorPrecheckResponse ? 'RESUME_REMAINING' : 'RESTART_FROM_FIRST';
+    const gracefulNotice = hadPriorPrecheckResponse
+      ? `Hi ${clientName}, thanks for your patience. We paused pre-readiness questions while your caregiver handled another request. Let's resume now: ${nextQuestion}`
+      : `Hi ${clientName}, thanks for your patience. We need to restart the quick pre-readiness check because the earlier flow was interrupted. First question: ${nextQuestion}`;
+    await pool.query(
+      `
+        INSERT INTO messages (appointment_id, sender_type, sender_id, content, is_agent)
+        VALUES ($1::uuid, 'AI_AGENT', $2, $3, true)
+      `,
+      [appointmentId, input.caregiverId, gracefulNotice],
+    );
+
+    const now = new Date();
+    const appointmentStart = new Date(String(appointmentRow.start_time || now.toISOString()));
+    const precheckEndsAt =
+      appointmentStart.getTime() > now.getTime()
+        ? appointmentStart.toISOString()
+        : new Date(now.getTime() + 12 * 60 * 60 * 1000).toISOString();
+    const resolvedIndexes = profile.questions
+      .map((question, idx) => (statusByCheck.get(question.checkType) === 'PASS' ? idx : -1))
+      .filter((idx) => idx >= 0);
+    const askedIndexes = [safeNextQuestionIndex];
+
+    const { settings, role } = await getAgentSettings(input.caregiverId);
+    const delegations = { ...(settings.delegations || {}) };
+    delegations[appointmentId] = {
+      appointmentId,
+      active: true,
+      objective: profile.objective,
+      questions: profile.questions.map((q) => q.prompt),
+      askedQuestionIndexes: askedIndexes,
+      resolvedQuestionIndexes: resolvedIndexes,
+      progressNotifiedIndexes: [],
+      completionNotifiedAt: undefined,
+      startedAt: now.toISOString(),
+      endsAt: precheckEndsAt,
+      source: 'PRECHECK_AUTOMATION',
+      systemManaged: true,
+      precheckProfileId: profile.id,
+      delegationType: 'FACT_CHECK',
+    };
+    settings.delegations = delegations;
+    await saveAgentSettings(input.caregiverId, role || 'CAREGIVER', settings, { activateAgent: true });
+
+    const plannerSeed = {
+      version: 1,
+      profileId: profile.id,
+      items: PRECHECK_CRITICAL_CHECK_ORDER.reduce((acc, checkType) => {
+        const status = statusByCheck.get(checkType) || 'PENDING';
+        const item: {
+          question: string;
+          status: 'PENDING' | 'PASS' | 'FAIL';
+          askedAt?: string;
+          answeredAt?: string;
+        } = {
+          question: String(questionByCheck.get(checkType) || ''),
+          status,
+        };
+        if (checkType === nextCheckType) {
+          item.askedAt = now.toISOString();
+        }
+        if (status === 'PASS') {
+          item.answeredAt = now.toISOString();
+        }
+        acc[checkType] = item;
+        return acc;
+      }, {} as Record<PrecheckCheckType, any>),
+    };
+    await pool.query(
+      `
+        INSERT INTO readiness_events (appointment_id, event_type, details)
+        VALUES ($1::uuid, 'PRECHECK_PLANNER', $2::jsonb)
+      `,
+      [appointmentId, JSON.stringify(plannerSeed)],
+    );
+
+    await pool.query(
+      `
+        INSERT INTO readiness_events (appointment_id, event_type, details)
+        VALUES ($1::uuid, 'PRECHECK_RESUMED', $2::jsonb)
+      `,
+      [
+        appointmentId,
+        JSON.stringify({
+          resumedAt: now.toISOString(),
+          interruptedAt,
+          mode: restartMode,
+          nextCheckType,
+          triggeredBy: 'MANUAL_DELEGATION_COMPLETION',
+        }),
+      ],
+    );
   }
 
   function normalizeCommandText(value: string): string {
@@ -2466,6 +3568,62 @@ Index is zero-based. If no question is appropriate, return -1.`,
     return scored.length > 0 ? scored[0].name : null;
   }
 
+  function commandHasClientPronoun(command: string): boolean {
+    const normalized = normalizeCommandText(command);
+    if (!normalized) return false;
+    return /\b(he|she|him|her|his|hers|they|them|their|the client|the patient)\b/.test(normalized);
+  }
+
+  function resolveClientReferenceFromContext(input: {
+    command: string;
+    appointments: CaregiverAppointmentRow[];
+    requestedAppointmentId?: string;
+    memory?: AssistantMemoryState;
+  }): CaregiverAppointmentRow | null {
+    const requestedId = String(input.requestedAppointmentId || '').trim();
+    if (requestedId) {
+      const direct = input.appointments.find((item) => item.appointmentId === requestedId);
+      if (direct) return direct;
+    }
+
+    const explicitHint = extractClientHint(input.command) || extractClientHintFromKnownAppointments(input.command, input.appointments);
+    if (explicitHint) {
+      const explicitMatch = input.appointments
+        .map((item) => ({
+          item,
+          score: scoreClientNameMatch(item.clientName, explicitHint),
+        }))
+        .filter((entry) => entry.score >= 60)
+        .sort((a, b) => b.score - a.score)[0];
+      if (explicitMatch?.item) {
+        return explicitMatch.item;
+      }
+    }
+
+    if (commandHasClientPronoun(input.command)) {
+      const memoryAppointmentId = String(input.memory?.appointmentId || '').trim();
+      if (memoryAppointmentId) {
+        const byAppointment = input.appointments.find((item) => item.appointmentId === memoryAppointmentId);
+        if (byAppointment) return byAppointment;
+      }
+      const memoryClientId = String(input.memory?.lastReferencedClientId || input.memory?.clientId || '').trim();
+      if (memoryClientId) {
+        const byClientId = input.appointments.find((item) => item.clientId === memoryClientId);
+        if (byClientId) return byClientId;
+      }
+      const memoryClientName = String(input.memory?.lastReferencedClientName || input.memory?.clientName || '').trim();
+      if (memoryClientName) {
+        const byClientName = input.appointments
+          .map((item) => ({ item, score: scoreClientNameMatch(item.clientName, memoryClientName) }))
+          .filter((entry) => entry.score >= 70)
+          .sort((a, b) => b.score - a.score)[0];
+        if (byClientName?.item) return byClientName.item;
+      }
+    }
+
+    return null;
+  }
+
   function pickAppointmentForCommand(
     appointments: CaregiverAppointmentRow[],
     command: string,
@@ -2524,7 +3682,7 @@ Index is zero-based. If no question is appropriate, return -1.`,
     if (appointments.length === 0) return null;
 
     const explicitClientHint = extractClientHint(command) || extractClientHintFromKnownAppointments(command, appointments);
-    const memoryClientHint = memory?.clientName || '';
+    const memoryClientHint = memory?.lastReferencedClientName || memory?.clientName || '';
     const combinedHint = explicitClientHint || memoryClientHint || '';
     const dateHint = parseBusinessDateHint(command) || memory?.businessDateHint || null;
 
@@ -3543,6 +4701,28 @@ Return:
       const entityId = String(req.body?.entityId || '').trim();
       const verified = Boolean(req.body?.verified);
       const active = req.body?.active === undefined ? true : Boolean(req.body?.active);
+      const metadataInput =
+        req.body?.metadata && typeof req.body.metadata === 'object' ? (req.body.metadata as Record<string, unknown>) : {};
+      const optInStatus = String(metadataInput.opt_in_status || '').trim().toUpperCase();
+      const allowedOptInStatus = new Set(['OPTED_IN', 'OPTED_OUT', 'UNKNOWN', 'PENDING']);
+      const metadata: Record<string, unknown> = {
+        ...metadataInput,
+      };
+      if (allowedOptInStatus.has(optInStatus)) {
+        metadata.opt_in_status = optInStatus;
+      }
+      if (metadataInput.opt_in_source !== undefined) {
+        metadata.opt_in_source = String(metadataInput.opt_in_source || '').trim();
+      }
+      if (metadataInput.opt_in_at !== undefined) {
+        metadata.opt_in_at = String(metadataInput.opt_in_at || '').trim();
+      }
+      if (metadataInput.locale !== undefined) {
+        metadata.locale = String(metadataInput.locale || '').trim();
+      }
+      if (metadataInput.last_delivery_status !== undefined) {
+        metadata.last_delivery_status = String(metadataInput.last_delivery_status || '').trim().toUpperCase();
+      }
 
       if (provider !== 'twilio_whatsapp') {
         return res.status(400).json({ error: 'provider must be twilio_whatsapp' });
@@ -3569,11 +4749,12 @@ Return:
             metadata,
             updated_at
           )
-          VALUES ($1, $2, $3, $4::uuid, $5, $6, '{}'::jsonb, NOW())
+          VALUES ($1, $2, $3, $4::uuid, $5, $6, $7::jsonb, NOW())
           ON CONFLICT (provider, endpoint, entity_type, entity_id)
           DO UPDATE SET
             active = EXCLUDED.active,
             verified = EXCLUDED.verified,
+            metadata = channel_endpoints.metadata || EXCLUDED.metadata,
             updated_at = NOW()
           RETURNING
             id::text AS id,
@@ -3583,10 +4764,11 @@ Return:
             entity_id::text AS "entityId",
             active,
             verified,
+            metadata,
             created_at AS "createdAt",
             updated_at AS "updatedAt"
         `,
-        [provider, endpoint, entityType, entityId, active, verified],
+        [provider, endpoint, entityType, entityId, active, verified, JSON.stringify(metadata)],
       );
 
       res.json({ success: true, data: result.rows[0] });
@@ -3608,6 +4790,7 @@ Return:
             entity_id::text AS "entityId",
             active,
             verified,
+            metadata,
             last_seen_at AS "lastSeenAt",
             created_at AS "createdAt",
             updated_at AS "updatedAt"
@@ -3623,10 +4806,117 @@ Return:
     }
   });
 
+  // POST /testing/whatsapp/replay-failed-inbound
+  // Replays inbound webhook events previously marked as FAILED_PROCESSING_RETRYABLE.
+  app.post('/testing/whatsapp/replay-failed-inbound', async (req: Request, res: Response) => {
+    try {
+      const limitRaw = Number(req.body?.limit || req.query.limit || 50);
+      const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.trunc(limitRaw))) : 50;
+
+      const result = await pool.query(
+        `
+          SELECT
+            provider_message_id,
+            payload
+          FROM webhook_inbox_events
+          WHERE provider = 'twilio_whatsapp'
+            AND status = 'FAILED_PROCESSING_RETRYABLE'
+          ORDER BY created_at ASC
+          LIMIT $1
+        `,
+        [limit],
+      );
+
+      let replayed = 0;
+      const skipped: Array<{ messageSid: string; reason: string }> = [];
+      for (const row of result.rows) {
+        const messageSid = String(row.provider_message_id || '').trim();
+        const payload = (row.payload || {}) as Record<string, unknown>;
+        const appointmentId = String(payload.appointmentId || '').trim();
+        const senderId = String(payload.senderId || '').trim();
+        const messageId = String(payload.messageId || '').trim();
+        const text = String(payload.text || '').trim();
+        const fromEndpoint = normalizeWhatsAppEndpoint(payload.fromEndpoint);
+        const toEndpoint = normalizeWhatsAppEndpoint(payload.toEndpoint);
+
+        if (!messageSid || !appointmentId || !senderId || !messageId || !text) {
+          skipped.push({ messageSid: messageSid || 'unknown', reason: 'MISSING_REQUIRED_REPLAY_FIELDS' });
+          continue;
+        }
+
+        await publishMessage(sqsClient, QUEUES.INCOMING_MESSAGES, {
+          type: 'NEW_MESSAGE',
+          appointmentId,
+          text,
+          senderType: 'FAMILY',
+          senderId,
+          messageId,
+          channel: 'WHATSAPP',
+          provider: 'TWILIO_WHATSAPP',
+          fromEndpoint,
+          toEndpoint,
+          externalMessageId: messageSid,
+        });
+        await pool.query(
+          `
+            UPDATE webhook_inbox_events
+            SET status = 'REPLAYED_QUEUED',
+                payload = payload || $3::jsonb,
+                processed_at = NOW()
+            WHERE provider = $1 AND provider_message_id = $2
+          `,
+          ['twilio_whatsapp', messageSid, JSON.stringify({ replayedAt: new Date().toISOString() })],
+        );
+        replayed += 1;
+      }
+
+      res.json({
+        success: true,
+        data: {
+          attempted: result.rows.length,
+          replayed,
+          skipped,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to replay WhatsApp failed inbound events', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // POST /testing/whatsapp/prune-webhook-events
+  // Deletes old webhook_inbox_events rows based on retention period.
+  app.post('/testing/whatsapp/prune-webhook-events', async (req: Request, res: Response) => {
+    try {
+      const daysRaw = Number(req.body?.retentionDays || req.query.retentionDays || config.whatsapp.statusRetentionDays);
+      const retentionDays = Number.isFinite(daysRaw) ? Math.max(1, Math.min(3650, Math.trunc(daysRaw))) : config.whatsapp.statusRetentionDays;
+
+      const deleteResult = await pool.query(
+        `
+          DELETE FROM webhook_inbox_events
+          WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')
+          RETURNING id
+        `,
+        [retentionDays],
+      );
+
+      res.json({
+        success: true,
+        data: {
+          retentionDays,
+          deletedCount: deleteResult.rowCount || 0,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to prune WhatsApp webhook events', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
   app.get('/auth/accounts', async (req: Request, res: Response) => {
     try {
       const role = String(req.query.role || '').toUpperCase();
-      const allowedRoles = new Set(['CAREGIVER', 'FAMILY']);
+      const allowedRoles = new Set(['CAREGIVER', 'FAMILY', 'COORDINATOR']);
       const params: any[] = [];
       const roleFilter = allowedRoles.has(role) ? `WHERE role = $1` : '';
 
@@ -3643,14 +4933,27 @@ Return:
         `,
         params
       );
+      const accounts = result.rows.map((row) => ({
+        username: row.username,
+        role: row.role,
+        userId: row.person_id,
+        name: row.display_name,
+      }));
+      const includeLocalCoordinator = LOCAL_COORDINATOR_FALLBACK_ENABLED && (!role || role === 'COORDINATOR');
+      const hasLocalCoordinator = accounts.some(
+        (entry) => String(entry.username || '').trim().toLowerCase() === LOCAL_COORDINATOR_USERNAME.toLowerCase(),
+      );
+      if (includeLocalCoordinator && !hasLocalCoordinator) {
+        accounts.unshift({
+          username: LOCAL_COORDINATOR_USERNAME,
+          role: 'COORDINATOR',
+          userId: LOCAL_COORDINATOR_USER_ID,
+          name: LOCAL_COORDINATOR_DISPLAY_NAME,
+        });
+      }
 
       res.json({
-        data: result.rows.map((row) => ({
-          username: row.username,
-          role: row.role,
-          userId: row.person_id,
-          name: row.display_name,
-        })),
+        data: accounts,
         testPassword: 'demo123',
       });
     } catch (error) {
@@ -3679,7 +4982,29 @@ Return:
       );
 
       if (result.rows.length === 0) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        const normalizedUsername = username.toLowerCase();
+        const localCoordinatorEnabled =
+          LOCAL_COORDINATOR_FALLBACK_ENABLED && normalizedUsername === LOCAL_COORDINATOR_USERNAME.toLowerCase();
+        if (!localCoordinatorEnabled || password !== LOCAL_COORDINATOR_PASSWORD) {
+          return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const token = crypto.randomBytes(24).toString('hex');
+        const sessionUser: SessionUser = {
+          userId: LOCAL_COORDINATOR_USER_ID,
+          role: 'COORDINATOR',
+          displayName: LOCAL_COORDINATOR_DISPLAY_NAME,
+          username: LOCAL_COORDINATOR_USERNAME,
+        };
+        sessions.set(token, sessionUser);
+        return res.json({
+          token,
+          user: {
+            userId: sessionUser.userId,
+            role: sessionUser.role,
+            name: sessionUser.displayName,
+            username: sessionUser.username,
+          },
+        });
       }
 
       const account = result.rows[0];
@@ -3757,6 +5082,7 @@ Return:
         SELECT 
           a.id, 
           a.aloha_appointment_id,
+          a.client_id::text AS client_id,
           a.start_time,
           a.end_time,
           a.service_type,
@@ -4114,10 +5440,25 @@ Return:
   // Manually updates a readiness check and triggers readiness re-evaluation.
   app.post('/appointments/:id/readiness/checks', async (req: Request, res: Response) => {
     try {
+      const sessionUser = getSessionUser(req);
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (!['CAREGIVER', 'COORDINATOR'].includes(sessionUser.role)) {
+        return res.status(403).json({ error: 'Only caregivers or coordinators can update readiness checks' });
+      }
       const { id } = req.params;
+      const appointmentScope = await loadAppointmentScope(id);
+      if (!appointmentScope) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+      if (!canSessionAccessAppointment(sessionUser, appointmentScope)) {
+        return res.status(403).json({ error: 'You are not allowed to update readiness for this appointment' });
+      }
       const checkType = String(req.body.checkType || '').trim().toUpperCase();
       const status = String(req.body.status || '').trim().toUpperCase();
-      const source = String(req.body.source || 'MANUAL').trim();
+      const sourceRaw = String(req.body.source || 'MANUAL').trim();
+      const overrideReason = String(req.body.overrideReason || '').trim();
 
       if (!checkType || !status) {
         return res.status(400).json({ error: 'checkType and status are required' });
@@ -4129,6 +5470,26 @@ Return:
         return res.status(400).json({ error: `Invalid status: ${status}` });
       }
 
+      const existingRes = await pool.query(
+        `
+          SELECT status
+          FROM readiness_checks
+          WHERE appointment_id = $1::uuid
+            AND check_type = $2
+          LIMIT 1
+        `,
+        [id, checkType],
+      );
+      const previousStatus = String(existingRes.rows[0]?.status || '').trim().toUpperCase() || 'PENDING';
+      const isCoordinatorOverride = sessionUser.role === 'COORDINATOR' && previousStatus === 'FAIL' && status === 'PASS';
+      if (isCoordinatorOverride && !overrideReason) {
+        return res.status(400).json({ error: 'overrideReason is required for coordinator FAIL -> PASS override' });
+      }
+
+      const finalSource = isCoordinatorOverride
+        ? 'SCHEDULER_MANUAL_OVERRIDE'
+        : (sourceRaw || 'MANUAL');
+
       await pool.query(
         `
           INSERT INTO readiness_checks (appointment_id, check_type, status, source, updated_at)
@@ -4139,8 +5500,33 @@ Return:
             source = EXCLUDED.source,
             updated_at = NOW()
         `,
-        [id, checkType, status, source]
+        [id, checkType, status, finalSource]
       );
+
+      if (isCoordinatorOverride) {
+        await pool.query(
+          `
+            INSERT INTO readiness_events (appointment_id, event_type, details)
+            VALUES ($1::uuid, 'READINESS_CHECK_OVERRIDDEN', $2::jsonb)
+          `,
+          [
+            id,
+            JSON.stringify({
+              checkType,
+              previousStatus,
+              nextStatus: status,
+              overrideReason,
+              overrideSource: 'SCHEDULER_MANUAL_OVERRIDE',
+              overriddenBy: {
+                userId: sessionUser.userId,
+                role: sessionUser.role,
+                name: sessionUser.displayName,
+              },
+              timestamp: new Date().toISOString(),
+            }),
+          ],
+        );
+      }
 
       await publishMessage(sqsClient, QUEUES.READINESS_EVALUATION, {
         messageId: `manual-${Date.now()}`,
@@ -4149,7 +5535,17 @@ Return:
         timestamp: new Date().toISOString(),
       });
 
-      res.json({ success: true, data: { appointmentId: id, checkType, status, source } });
+      res.json({
+        success: true,
+        data: {
+          appointmentId: id,
+          checkType,
+          status,
+          source: finalSource,
+          previousStatus,
+          overridden: isCoordinatorOverride,
+        },
+      });
     } catch (error) {
       console.error('Failed to update readiness check', error);
       res.status(500).json({ error: 'Internal Server Error' });
@@ -4415,22 +5811,39 @@ Return:
   });
 
   // POST /webhooks/twilio/whatsapp/inbound
-  // Twilio WhatsApp inbound webhook for trial/sandbox demo traffic.
+  // Twilio WhatsApp inbound webhook for production traffic.
   app.post('/webhooks/twilio/whatsapp/inbound', async (req: Request, res: Response) => {
+    const startedAt = Date.now();
+    const messageSid = String(req.body?.MessageSid || '').trim();
+    const fromRaw = String(req.body?.From || '').trim();
+    const toRaw = String(req.body?.To || '').trim();
+    const rawBodyText = String(req.body?.Body || '').trim();
+    const numMedia = Math.max(0, Math.trunc(Number(req.body?.NumMedia || '0')));
+
+    const upsertInboundEvent = async (status: string, patchPayload?: Record<string, unknown>) => {
+      if (!messageSid) return;
+      await pool.query(
+        `
+          UPDATE webhook_inbox_events
+          SET status = $3,
+              payload = payload || $4::jsonb,
+              processed_at = NOW()
+          WHERE provider = $1 AND provider_message_id = $2
+        `,
+        ['twilio_whatsapp', messageSid, status, JSON.stringify(patchPayload || {})],
+      );
+    };
+
     try {
       if (!config.whatsapp.enabled) {
         return res.status(503).json({ error: 'WhatsApp integration is disabled' });
       }
 
       if (!isValidTwilioSignature(req)) {
+        metric('signature_invalid', { endpoint: '/webhooks/twilio/whatsapp/inbound' });
         return res.status(401).json({ error: 'Invalid Twilio signature' });
       }
 
-      const messageSid = String(req.body?.MessageSid || '').trim();
-      const fromRaw = String(req.body?.From || '').trim();
-      const toRaw = String(req.body?.To || '').trim();
-      const bodyText = String(req.body?.Body || '').trim();
-      const numMedia = Math.max(0, Math.trunc(Number(req.body?.NumMedia || '0')));
       if (!messageSid) {
         return res.status(400).json({ error: 'MessageSid is required' });
       }
@@ -4451,71 +5864,80 @@ Return:
         ['twilio_whatsapp', messageSid, JSON.stringify(req.body || {})],
       );
       if (dedupeInsert.rows.length === 0) {
+        metric('inbound_deduped', { messageSid });
         return sendTwilioXmlAck(res);
       }
 
       const fromEndpoint = normalizeWhatsAppEndpoint(fromRaw);
       const toEndpoint = normalizeWhatsAppEndpoint(toRaw);
       if (!fromEndpoint) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_INVALID_FROM', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+        await upsertInboundEvent('IGNORED_INVALID_FROM');
+        metric('inbound_ignored', { reason: 'IGNORED_INVALID_FROM' });
         return sendTwilioXmlAck(res);
       }
 
       if (!isWhatsAppAllowlisted(fromEndpoint)) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_NOT_ALLOWLISTED', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+        await upsertInboundEvent('IGNORED_NOT_ALLOWLISTED', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_NOT_ALLOWLISTED', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
         return sendTwilioXmlAck(res);
       }
 
       if (numMedia > 0) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_UNSUPPORTED_MEDIA', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+        await upsertInboundEvent('IGNORED_UNSUPPORTED_MEDIA', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_UNSUPPORTED_MEDIA', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
         return sendTwilioXmlAck(res);
       }
 
+      const bodyText = rawBodyText.slice(0, config.whatsapp.maxInboundChars);
       if (!bodyText) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_EMPTY_BODY', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+        await upsertInboundEvent('IGNORED_EMPTY_BODY', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_EMPTY_BODY', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
         return sendTwilioXmlAck(res);
       }
 
-      const mappedClientId = await resolveClientIdByWhatsAppEndpoint(fromEndpoint);
-      if (!mappedClientId) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_UNMAPPED_ENDPOINT', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+      if (rawBodyText.length > config.whatsapp.maxInboundChars) {
+        await upsertInboundEvent('IGNORED_BODY_TOO_LONG', {
+          fromEndpoint,
+          toEndpoint,
+          bodyLength: rawBodyText.length,
+          maxInboundChars: config.whatsapp.maxInboundChars,
+        });
+        metric('inbound_ignored', {
+          reason: 'IGNORED_BODY_TOO_LONG',
+          fromEndpoint: redactPhoneForLogs(fromEndpoint),
+          bodyLength: rawBodyText.length,
+        });
         return sendTwilioXmlAck(res);
       }
+
+      if (await isRateLimitedEndpoint(fromEndpoint)) {
+        await upsertInboundEvent('IGNORED_RATE_LIMITED', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_RATE_LIMITED', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
+        return sendTwilioXmlAck(res);
+      }
+
+      const binding = await resolveWhatsAppEndpointBinding(fromEndpoint);
+      if (!binding) {
+        await upsertInboundEvent('IGNORED_UNMAPPED_ENDPOINT', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_UNMAPPED_ENDPOINT', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
+        return sendTwilioXmlAck(res);
+      }
+      if (!binding.active || binding.blocked) {
+        await upsertInboundEvent('IGNORED_BLOCKED_ENDPOINT', {
+          fromEndpoint,
+          toEndpoint,
+          active: binding.active,
+          blocked: binding.blocked,
+        });
+        metric('inbound_ignored', { reason: 'IGNORED_BLOCKED_ENDPOINT', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
+        return sendTwilioXmlAck(res);
+      }
+      if (!config.whatsapp.trialMode && !binding.verified) {
+        await upsertInboundEvent('IGNORED_UNVERIFIED_ENDPOINT', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_UNVERIFIED_ENDPOINT', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
+        return sendTwilioXmlAck(res);
+      }
+      const mappedClientId = binding.clientId;
 
       await pool.query(
         `
@@ -4531,14 +5953,8 @@ Return:
 
       const appointmentScope = await resolveOperationalAppointmentForClient(mappedClientId);
       if (!appointmentScope?.appointmentId) {
-        await pool.query(
-          `
-            UPDATE webhook_inbox_events
-            SET status = 'IGNORED_NO_APPOINTMENT_CONTEXT', processed_at = NOW()
-            WHERE provider = $1 AND provider_message_id = $2
-          `,
-          ['twilio_whatsapp', messageSid],
-        );
+        await upsertInboundEvent('IGNORED_NO_APPOINTMENT_CONTEXT', { fromEndpoint, toEndpoint });
+        metric('inbound_ignored', { reason: 'IGNORED_NO_APPOINTMENT_CONTEXT', fromEndpoint: redactPhoneForLogs(fromEndpoint) });
         return sendTwilioXmlAck(res);
       }
 
@@ -4552,44 +5968,63 @@ Return:
       );
       const newMessage = messageInsert.rows[0];
 
-      await publishMessage(sqsClient, QUEUES.INCOMING_MESSAGES, {
-        type: 'NEW_MESSAGE',
+      try {
+        await publishMessage(sqsClient, QUEUES.INCOMING_MESSAGES, {
+          type: 'NEW_MESSAGE',
+          appointmentId: appointmentScope.appointmentId,
+          text: bodyText,
+          senderType: 'FAMILY',
+          senderId: mappedClientId,
+          messageId: newMessage.id,
+          channel: 'WHATSAPP',
+          provider: 'TWILIO_WHATSAPP',
+          fromEndpoint,
+          toEndpoint,
+          externalMessageId: messageSid,
+        });
+      } catch (publishError) {
+        await upsertInboundEvent('FAILED_PROCESSING_RETRYABLE', {
+          appointmentId: appointmentScope.appointmentId,
+          messageId: newMessage.id,
+          senderId: mappedClientId,
+          fromEndpoint,
+          toEndpoint,
+          text: bodyText,
+          queue: QUEUES.INCOMING_MESSAGES,
+          queuePublishError: publishError instanceof Error ? publishError.message : String(publishError),
+        });
+        metric('inbound_failed_retryable', {
+          reason: 'QUEUE_PUBLISH_FAILED',
+          fromEndpoint: redactPhoneForLogs(fromEndpoint),
+        });
+        return sendTwilioXmlAck(res);
+      }
+
+      await upsertInboundEvent('PROCESSED', {
         appointmentId: appointmentScope.appointmentId,
-        text: bodyText,
-        senderType: 'FAMILY',
-        senderId: mappedClientId,
         messageId: newMessage.id,
-        channel: 'WHATSAPP',
-        provider: 'TWILIO_WHATSAPP',
+        senderId: mappedClientId,
+        text: bodyText,
         fromEndpoint,
         toEndpoint,
-        externalMessageId: messageSid,
       });
-
-      await pool.query(
-        `
-          UPDATE webhook_inbox_events
-          SET status = 'PROCESSED',
-              payload = payload || $3::jsonb,
-              processed_at = NOW()
-          WHERE provider = $1 AND provider_message_id = $2
-        `,
-        [
-          'twilio_whatsapp',
-          messageSid,
-          JSON.stringify({
-            appointmentId: appointmentScope.appointmentId,
-            messageId: newMessage.id,
-            fromEndpoint,
-            toEndpoint,
-          }),
-        ],
-      );
+      metric('inbound_processed', {
+        fromEndpoint: redactPhoneForLogs(fromEndpoint),
+        latencyMs: Date.now() - startedAt,
+      });
 
       return sendTwilioXmlAck(res);
     } catch (error) {
+      await upsertInboundEvent('FAILED_PROCESSING_RETRYABLE', {
+        error: error instanceof Error ? error.message : String(error),
+        from: config.whatsapp.redactLogs ? undefined : fromRaw,
+      });
+      metric('inbound_failed_retryable', {
+        reason: 'UNHANDLED',
+        messageSid: messageSid || null,
+      });
       console.error('Failed Twilio WhatsApp inbound webhook', error);
-      return res.status(500).json({ error: 'Internal Server Error' });
+      return sendTwilioXmlAck(res);
     }
   });
 
@@ -4602,11 +6037,13 @@ Return:
       }
 
       if (!isValidTwilioSignature(req)) {
+        metric('signature_invalid', { endpoint: '/webhooks/twilio/whatsapp/status' });
         return res.status(401).json({ error: 'Invalid Twilio signature' });
       }
 
       const messageSid = String(req.body?.MessageSid || '').trim();
       const messageStatus = String(req.body?.MessageStatus || req.body?.SmsStatus || '').trim().toUpperCase();
+      const toEndpoint = normalizeWhatsAppEndpoint(req.body?.To);
       if (!messageSid) {
         return res.status(400).json({ error: 'MessageSid is required' });
       }
@@ -4631,6 +6068,23 @@ Return:
         `,
         ['twilio_whatsapp_outbound', messageSid, messageStatus || 'UNKNOWN', JSON.stringify(req.body || {})],
       );
+      if (toEndpoint) {
+        await pool.query(
+          `
+            UPDATE channel_endpoints
+            SET metadata = metadata || $2::jsonb,
+                updated_at = NOW()
+            WHERE provider = 'twilio_whatsapp'
+              AND endpoint = $1
+              AND entity_type = 'CLIENT'
+          `,
+          [toEndpoint, JSON.stringify({ last_delivery_status: messageStatus || 'UNKNOWN' })],
+        );
+      }
+      metric('outbound_status_updated', {
+        messageStatus: messageStatus || 'UNKNOWN',
+        toEndpoint: redactPhoneForLogs(toEndpoint),
+      });
 
       return sendTwilioXmlAck(res);
     } catch (error) {
@@ -4721,6 +6175,593 @@ Return:
       res.json({ data: result.rows });
     } catch (error) {
       res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // GET /scheduler/threads
+  // Coordinator view of caregiver-scoped scheduler threads and open escalation counts.
+  app.get('/scheduler/threads', async (req: Request, res: Response) => {
+    try {
+      if (!authorizeCoordinatorAccess(req, res)) return;
+
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.trunc(limitRaw))) : 100;
+
+      const result = await pool.query(
+        `
+          WITH open_counts AS (
+            SELECT
+              caregiver_id,
+              COUNT(*)::int AS open_count
+            FROM escalations
+            WHERE status IN ('OPEN', 'ACKNOWLEDGED', 'ACTION_REQUESTED')
+            GROUP BY caregiver_id
+          ),
+          last_messages AS (
+            SELECT
+              t.caregiver_id,
+              MAX(m.created_at) AS last_message_at
+            FROM scheduler_threads t
+            LEFT JOIN scheduler_thread_messages m ON m.thread_id = t.id
+            GROUP BY t.caregiver_id
+          )
+          SELECT
+            c.id::text AS caregiver_id,
+            c.name AS caregiver_name,
+            COALESCE(t.id::text, '') AS thread_id,
+            COALESCE(o.open_count, 0)::int AS open_escalation_count,
+            0::int AS unread_count,
+            COALESCE(l.last_message_at, t.updated_at, c.updated_at, c.created_at)::text AS last_activity_at
+          FROM caregivers c
+          LEFT JOIN scheduler_threads t ON t.caregiver_id = c.id::text
+          LEFT JOIN open_counts o ON o.caregiver_id = c.id::text
+          LEFT JOIN last_messages l ON l.caregiver_id = c.id::text
+          ORDER BY
+            CASE WHEN COALESCE(o.open_count, 0) > 0 THEN 0 ELSE 1 END,
+            COALESCE(l.last_message_at, t.updated_at, c.updated_at, c.created_at) DESC,
+            c.name ASC
+          LIMIT $1::int
+        `,
+        [limit],
+      );
+
+      res.json({
+        data: result.rows.map((row) => ({
+          caregiverId: String(row.caregiver_id || ''),
+          caregiverName: String(row.caregiver_name || ''),
+          threadId: String(row.thread_id || '').trim() || null,
+          openEscalationCount: Number(row.open_escalation_count || 0),
+          unreadCount: Number(row.unread_count || 0),
+          lastActivityAt: String(row.last_activity_at || ''),
+        })),
+      });
+    } catch (error) {
+      console.error('Failed to load scheduler threads', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // GET /scheduler/threads/:caregiverId/messages
+  // Fetches scheduler thread messages for coordinator or the owning caregiver.
+  app.get('/scheduler/threads/:caregiverId/messages', async (req: Request, res: Response) => {
+    try {
+      const caregiverId = String(req.params.caregiverId || '').trim();
+      if (!caregiverId) {
+        return res.status(400).json({ error: 'caregiverId is required' });
+      }
+
+      const sessionUser = authorizeSchedulerThreadAccess(req, res, caregiverId);
+      if (!sessionUser) return;
+
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.trunc(limitRaw))) : 100;
+      const before = String(req.query.before || '').trim() || undefined;
+      const payload = await listSchedulerThreadMessages({ caregiverId, limit, before });
+
+      res.json({
+        data: payload.messages,
+        threadId: payload.threadId,
+      });
+    } catch (error) {
+      console.error('Failed to load scheduler thread messages', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // POST /scheduler/threads/:caregiverId/messages
+  // Posts a caregiver/coordinator message in the scheduler thread.
+  app.post('/scheduler/threads/:caregiverId/messages', async (req: Request, res: Response) => {
+    try {
+      const caregiverId = String(req.params.caregiverId || '').trim();
+      if (!caregiverId) {
+        return res.status(400).json({ error: 'caregiverId is required' });
+      }
+      const sessionUser = authorizeSchedulerThreadAccess(req, res, caregiverId);
+      if (!sessionUser) return;
+
+      const content = String(req.body.content || '').trim();
+      if (!content) {
+        return res.status(400).json({ error: 'content is required' });
+      }
+
+      const escalationIdRaw = String(req.body.escalationId || '').trim();
+      const escalationId = escalationIdRaw ? normalizeOptionalUuid(escalationIdRaw) : undefined;
+      if (escalationIdRaw && !escalationId) {
+        return res.status(400).json({ error: 'escalationId must be a valid UUID' });
+      }
+      if (escalationId) {
+        const escalationRes = await pool.query(
+          `
+            SELECT caregiver_id::text AS caregiver_id
+            FROM escalations
+            WHERE id = $1::uuid
+            LIMIT 1
+          `,
+          [escalationId],
+        );
+        if (escalationRes.rows.length === 0) {
+          return res.status(404).json({ error: 'Escalation not found' });
+        }
+        const ownerCaregiverId = String(escalationRes.rows[0]?.caregiver_id || '').trim();
+        if (ownerCaregiverId !== caregiverId) {
+          return res.status(400).json({ error: 'escalationId does not belong to this caregiver thread' });
+        }
+      }
+
+      const metadata = req.body.metadata && typeof req.body.metadata === 'object'
+        ? (req.body.metadata as Record<string, unknown>)
+        : {};
+      const senderType: SchedulerThreadActorType =
+        sessionUser.role === 'COORDINATOR' ? 'COORDINATOR' : 'CAREGIVER';
+      const message = await appendSchedulerThreadMessage({
+        caregiverId,
+        senderType,
+        senderId: sessionUser.userId,
+        content,
+        escalationId,
+        metadata,
+      });
+      const metadataEventType = String((metadata as any).eventType || (metadata as any).event_type || '')
+        .trim()
+        .toUpperCase();
+      if (metadataEventType === 'SCHEDULER_JUMPED_TO_APPOINTMENT_CHAT' && sessionUser.role === 'COORDINATOR') {
+        const eventAppointmentIdRaw = String((metadata as any).appointmentId || req.body.appointmentId || '').trim();
+        const eventAppointmentId = eventAppointmentIdRaw
+          ? normalizeOptionalUuid(eventAppointmentIdRaw)
+          : undefined;
+        if (eventAppointmentId) {
+          const appointmentScope = await loadAppointmentScope(eventAppointmentId);
+          if (appointmentScope && canSessionAccessAppointment(sessionUser, appointmentScope)) {
+            await pool.query(
+              `
+                INSERT INTO readiness_events (appointment_id, event_type, details)
+                VALUES ($1::uuid, 'SCHEDULER_JUMPED_TO_APPOINTMENT_CHAT', $2::jsonb)
+              `,
+              [
+                eventAppointmentId,
+                JSON.stringify({
+                  threadId: message.threadId,
+                  escalationId: escalationId || null,
+                  caregiverId,
+                  coordinatorId: sessionUser.userId,
+                  coordinatorName: sessionUser.displayName,
+                  createdAt: new Date().toISOString(),
+                }),
+              ],
+            );
+          }
+        }
+      }
+
+      res.json({ success: true, data: message });
+    } catch (error) {
+      console.error('Failed to post scheduler thread message', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // GET /escalations
+  // Lists escalations for coordinator (all) or caregiver (own only).
+  app.get('/escalations', async (req: Request, res: Response) => {
+    try {
+      const sessionUser = getSessionUser(req);
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (!['CAREGIVER', 'COORDINATOR'].includes(sessionUser.role)) {
+        return res.status(403).json({ error: 'Only caregivers or coordinators can access escalations' });
+      }
+
+      const clauses: string[] = [];
+      const params: any[] = [];
+
+      if (sessionUser.role === 'CAREGIVER') {
+        clauses.push(`caregiver_id = $${params.length + 1}`);
+        params.push(sessionUser.userId);
+      } else {
+        const caregiverIdFilter = String(req.query.caregiverId || '').trim();
+        if (caregiverIdFilter) {
+          clauses.push(`caregiver_id = $${params.length + 1}`);
+          params.push(caregiverIdFilter);
+        }
+      }
+
+      const appointmentIdRaw = String(req.query.appointmentId || '').trim();
+      const appointmentId = appointmentIdRaw ? normalizeOptionalUuid(appointmentIdRaw) : undefined;
+      if (appointmentIdRaw && !appointmentId) {
+        return res.status(400).json({ error: 'appointmentId must be a valid UUID' });
+      }
+      if (appointmentId) {
+        if (sessionUser.role === 'CAREGIVER') {
+          const scope = await loadAppointmentScope(appointmentId);
+          if (!scope || !canSessionAccessAppointment(sessionUser, scope)) {
+            return res.status(403).json({ error: 'You are not allowed to view escalations for this appointment' });
+          }
+        }
+        clauses.push(`appointment_id = $${params.length + 1}::uuid`);
+        params.push(appointmentId);
+      }
+
+      const statusRaw = String(req.query.status || '').trim().toUpperCase();
+      if (statusRaw) {
+        if (!ESCALATION_STATUSES.has(statusRaw as EscalationStatus)) {
+          return res.status(400).json({ error: `Invalid escalation status: ${statusRaw}` });
+        }
+        clauses.push(`status = $${params.length + 1}`);
+        params.push(statusRaw);
+      }
+
+      const categoryRaw = String(req.query.category || '').trim().toUpperCase();
+      if (categoryRaw) {
+        if (!ESCALATION_CATEGORIES.has(categoryRaw as EscalationCategory)) {
+          return res.status(400).json({ error: `Invalid escalation category: ${categoryRaw}` });
+        }
+        clauses.push(`category = $${params.length + 1}`);
+        params.push(categoryRaw);
+      }
+
+      const beforeIso = String(req.query.before || '').trim();
+      if (beforeIso) {
+        clauses.push(`opened_at < $${params.length + 1}::timestamptz`);
+        params.push(beforeIso);
+      }
+
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.trunc(limitRaw))) : 100;
+      params.push(limit);
+
+      const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const result = await pool.query(
+        `
+          SELECT
+            id::text,
+            caregiver_id::text,
+            COALESCE(appointment_id::text, '') AS appointment_id,
+            COALESCE(delegation_id, '') AS delegation_id,
+            source,
+            category,
+            priority,
+            status,
+            summary,
+            context_json,
+            opened_by,
+            COALESCE(resolved_by, '') AS resolved_by,
+            COALESCE(resolution_type, '') AS resolution_type,
+            opened_at::text,
+            COALESCE(acknowledged_at::text, '') AS acknowledged_at,
+            COALESCE(resolved_at::text, '') AS resolved_at,
+            created_at::text,
+            updated_at::text
+          FROM escalations
+          ${whereSql}
+          ORDER BY opened_at DESC
+          LIMIT $${params.length}::int
+        `,
+        params,
+      );
+
+      res.json({ data: result.rows.map((row) => mapEscalationRow(row)) });
+    } catch (error) {
+      console.error('Failed to list escalations', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // POST /escalations
+  // Creates a new escalation and posts a system notice in the scheduler thread.
+  app.post('/escalations', async (req: Request, res: Response) => {
+    try {
+      const sessionUser = getSessionUser(req);
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (!['CAREGIVER', 'COORDINATOR'].includes(sessionUser.role)) {
+        return res.status(403).json({ error: 'Only caregivers or coordinators can create escalations' });
+      }
+
+      const category = String(req.body.category || '').trim().toUpperCase();
+      if (!ESCALATION_CATEGORIES.has(category as EscalationCategory)) {
+        return res.status(400).json({ error: 'Valid escalation category is required' });
+      }
+
+      const summary = String(req.body.summary || '').trim();
+      if (!summary) {
+        return res.status(400).json({ error: 'summary is required' });
+      }
+
+      const sourceRaw = String(req.body.source || 'AGENT_DESK').trim().toUpperCase();
+      const source = ESCALATION_SOURCES.has(sourceRaw as EscalationSource)
+        ? (sourceRaw as EscalationSource)
+        : 'AGENT_DESK';
+      const contextJson = req.body.context && typeof req.body.context === 'object'
+        ? (req.body.context as Record<string, unknown>)
+        : {};
+      const delegationId = String(req.body.delegationId || '').trim() || null;
+
+      const appointmentIdRaw = String(req.body.appointmentId || '').trim();
+      const appointmentId = appointmentIdRaw ? normalizeOptionalUuid(appointmentIdRaw) : undefined;
+      if (appointmentIdRaw && !appointmentId) {
+        return res.status(400).json({ error: 'appointmentId must be a valid UUID' });
+      }
+
+      let caregiverId = String(req.body.caregiverId || '').trim();
+      let appointmentScope: AppointmentScopeRow | null = null;
+      if (appointmentId) {
+        appointmentScope = await loadAppointmentScope(appointmentId);
+        if (!appointmentScope) {
+          return res.status(404).json({ error: 'Appointment not found' });
+        }
+        if (!canSessionAccessAppointment(sessionUser, appointmentScope)) {
+          return res.status(403).json({ error: 'You are not allowed to escalate for this appointment' });
+        }
+        if (!caregiverId) caregiverId = appointmentScope.caregiverId;
+      }
+
+      if (sessionUser.role === 'CAREGIVER') {
+        caregiverId = sessionUser.userId;
+      }
+      if (!caregiverId) {
+        return res.status(400).json({ error: 'caregiverId is required (or inferable from appointmentId)' });
+      }
+      if (appointmentScope && caregiverId !== appointmentScope.caregiverId) {
+        return res.status(400).json({ error: 'caregiverId does not match appointment caregiver' });
+      }
+
+      const openedBy = sessionUser.role;
+      const insertRes = await pool.query(
+        `
+          INSERT INTO escalations (
+            caregiver_id,
+            appointment_id,
+            delegation_id,
+            source,
+            category,
+            priority,
+            status,
+            summary,
+            context_json,
+            opened_by,
+            opened_at,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2::uuid,
+            $3,
+            $4,
+            $5,
+            'HIGH',
+            'OPEN',
+            $6,
+            $7::jsonb,
+            $8,
+            NOW(),
+            NOW(),
+            NOW()
+          )
+          RETURNING
+            id::text,
+            caregiver_id::text,
+            COALESCE(appointment_id::text, '') AS appointment_id,
+            COALESCE(delegation_id, '') AS delegation_id,
+            source,
+            category,
+            priority,
+            status,
+            summary,
+            context_json,
+            opened_by,
+            COALESCE(resolved_by, '') AS resolved_by,
+            COALESCE(resolution_type, '') AS resolution_type,
+            opened_at::text,
+            COALESCE(acknowledged_at::text, '') AS acknowledged_at,
+            COALESCE(resolved_at::text, '') AS resolved_at,
+            created_at::text,
+            updated_at::text
+        `,
+        [
+          caregiverId,
+          appointmentId || null,
+          delegationId,
+          source,
+          category,
+          summary,
+          JSON.stringify(contextJson),
+          openedBy,
+        ],
+      );
+      const escalation = mapEscalationRow(insertRes.rows[0]);
+      const schedulerMessage = await appendSchedulerThreadMessage({
+        caregiverId,
+        senderType: 'SYSTEM',
+        content: `Escalation opened (${category}): ${summary}`,
+        escalationId: escalation.id,
+        metadata: {
+          eventType: 'ESCALATION_OPENED',
+          category,
+          priority: 'HIGH',
+          appointmentId: escalation.appointmentId || null,
+        },
+      });
+
+      res.json({
+        success: true,
+        data: escalation,
+        schedulerThread: {
+          threadId: schedulerMessage.threadId,
+          messageId: schedulerMessage.id,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to create escalation', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+
+  // PATCH /escalations/:id
+  // Updates escalation status and resolution metadata.
+  app.patch('/escalations/:id', async (req: Request, res: Response) => {
+    try {
+      const escalationId = String(req.params.id || '').trim();
+      const normalizedEscalationId = normalizeOptionalUuid(escalationId);
+      if (!normalizedEscalationId) {
+        return res.status(400).json({ error: 'id must be a valid UUID' });
+      }
+
+      const sessionUser = getSessionUser(req);
+      if (!sessionUser) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (!['CAREGIVER', 'COORDINATOR'].includes(sessionUser.role)) {
+        return res.status(403).json({ error: 'Only caregivers or coordinators can update escalations' });
+      }
+
+      const existingRes = await pool.query(
+        `
+          SELECT
+            id::text,
+            caregiver_id::text,
+            status
+          FROM escalations
+          WHERE id = $1::uuid
+          LIMIT 1
+        `,
+        [normalizedEscalationId],
+      );
+      if (existingRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Escalation not found' });
+      }
+
+      const existing = existingRes.rows[0];
+      const ownerCaregiverId = String(existing.caregiver_id || '').trim();
+      const currentStatus = String(existing.status || '').trim().toUpperCase() as EscalationStatus;
+      if (sessionUser.role === 'CAREGIVER' && sessionUser.userId !== ownerCaregiverId) {
+        return res.status(403).json({ error: 'Caregivers can only update their own escalations' });
+      }
+
+      const nextStatusRaw = String(req.body.status || '').trim().toUpperCase();
+      if (!ESCALATION_STATUSES.has(nextStatusRaw as EscalationStatus)) {
+        return res.status(400).json({ error: 'Valid status is required' });
+      }
+      const nextStatus = nextStatusRaw as EscalationStatus;
+      if (!canTransitionEscalationStatus(currentStatus, nextStatus)) {
+        return res.status(409).json({ error: `Cannot transition escalation status from ${currentStatus} to ${nextStatus}` });
+      }
+
+      const resolutionTypeRaw = String(req.body.resolutionType || '').trim().toUpperCase();
+      const resolutionType = resolutionTypeRaw
+        ? (ESCALATION_RESOLUTION_TYPES.has(resolutionTypeRaw as EscalationResolutionType)
+          ? resolutionTypeRaw
+          : null)
+        : null;
+      if (resolutionTypeRaw && !resolutionType) {
+        return res.status(400).json({ error: `Invalid resolutionType: ${resolutionTypeRaw}` });
+      }
+      const resolutionNote = String(req.body.resolutionNote || '').trim();
+      const actor = `${sessionUser.role}:${sessionUser.userId}`;
+      const markResolved = ['RESOLVED', 'HANDOFF_TO_CAREGIVER', 'AUTO_CLOSED'].includes(nextStatus);
+
+      const updatedRes = await pool.query(
+        `
+          UPDATE escalations
+          SET
+            status = $2::text,
+            resolution_type = COALESCE($3::text, resolution_type),
+            resolved_by = CASE
+              WHEN $4::boolean = true THEN $5::text
+              ELSE resolved_by
+            END,
+            acknowledged_at = CASE
+              WHEN $2::text = 'ACKNOWLEDGED'::text AND acknowledged_at IS NULL THEN NOW()
+              ELSE acknowledged_at
+            END,
+            resolved_at = CASE
+              WHEN $4::boolean = true THEN NOW()
+              ELSE resolved_at
+            END,
+            context_json = CASE
+              WHEN $6::text <> '' THEN COALESCE(context_json, '{}'::jsonb) || jsonb_build_object('resolutionNote', $6::text)
+              ELSE context_json
+            END,
+            updated_at = NOW()
+          WHERE id = $1::uuid
+          RETURNING
+            id::text,
+            caregiver_id::text,
+            COALESCE(appointment_id::text, '') AS appointment_id,
+            COALESCE(delegation_id, '') AS delegation_id,
+            source,
+            category,
+            priority,
+            status,
+            summary,
+            context_json,
+            opened_by,
+            COALESCE(resolved_by, '') AS resolved_by,
+            COALESCE(resolution_type, '') AS resolution_type,
+            opened_at::text,
+            COALESCE(acknowledged_at::text, '') AS acknowledged_at,
+            COALESCE(resolved_at::text, '') AS resolved_at,
+            created_at::text,
+            updated_at::text
+        `,
+        [
+          normalizedEscalationId,
+          nextStatus,
+          resolutionType,
+          markResolved,
+          actor,
+          resolutionNote,
+        ],
+      );
+      const escalation = mapEscalationRow(updatedRes.rows[0]);
+      const statusMessage = await appendSchedulerThreadMessage({
+        caregiverId: ownerCaregiverId,
+        senderType: 'SYSTEM',
+        content: `Escalation ${escalation.id.slice(0, 8)} marked ${nextStatus} by ${sessionUser.displayName}.`,
+        escalationId: escalation.id,
+        metadata: {
+          eventType: 'ESCALATION_STATUS_UPDATED',
+          status: nextStatus,
+          actor,
+        },
+      });
+
+      res.json({
+        success: true,
+        data: escalation,
+        schedulerThread: {
+          threadId: statusMessage.threadId,
+          messageId: statusMessage.id,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to update escalation', error);
+      const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
+      res.status(500).json({
+        error: process.env.NODE_ENV === 'production' ? 'Internal Server Error' : errorMessage,
+      });
     }
   });
 
@@ -4863,46 +6904,17 @@ Return:
   });
 
   // POST /agents/:userId/delegations/start
-  // Starts a time-boxed delegation for an appointment
+  // Deprecated: delegation start must go through /agents/:userId/command (confirmation-gated).
   app.post('/agents/:userId/delegations/start', async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
       if (!authorizeAgentUserAccess(req, res, userId)) {
         return;
       }
-      const { appointmentId, objective, durationMinutes, questions, questionItems, delegationType, forceStart } = req.body;
-
-      if (!appointmentId || !objective || !durationMinutes) {
-        return res.status(400).json({ error: 'appointmentId, objective, durationMinutes are required' });
-      }
-      const startResult = await startDelegationWindow({
-        userId,
-        appointmentId: String(appointmentId),
-        objective: String(objective),
-        durationMinutes: Number(durationMinutes),
-        questions: Array.isArray(questions) ? questions : [],
-        questionItems: Array.isArray(questionItems) ? questionItems : undefined,
-        delegationType:
-          (() => {
-            const raw = String(delegationType || '').trim().toUpperCase();
-            if (raw === 'FACT_CHECK' || raw === 'LOGISTICS' || raw === 'OPEN_ENDED') {
-              return raw as DelegationType;
-            }
-            return undefined;
-          })(),
-        forceStart: Boolean(forceStart),
+      return res.status(410).json({
+        error: 'Manual delegation start endpoint is deprecated. Use POST /agents/:userId/command to initiate delegation with contact confirmation.',
+        code: 'DELEGATION_START_VIA_COMMAND_REQUIRED',
       });
-      if (!startResult.ok) {
-        if (startResult.status === 409) {
-          return res.status(409).json({
-            error: startResult.error,
-            failedChecks: startResult.failedChecks,
-          });
-        }
-        return res.status(startResult.status).json({ error: startResult.error });
-      }
-
-      res.json({ success: true, data: startResult.delegation });
     } catch (error) {
       console.error('Failed to start delegation', error);
       res.status(500).json({ error: 'Internal Server Error' });
@@ -4919,6 +6931,7 @@ Return:
       }
       const rawCommand = String(req.body.command || req.body.text || '').trim();
       const requestedAppointmentId = String(req.body.appointmentId || '').trim();
+      const normalizedRequestedAppointmentId = normalizeOptionalUuid(requestedAppointmentId);
       const forceStart = Boolean(req.body.forceStart);
       const requestedDuration = Number(req.body.durationMinutes);
       const toolTrace: AgentToolTraceEntry[] = [];
@@ -4955,15 +6968,19 @@ Return:
 
       let { settings, role, version: settingsVersion } = await getAgentSettings(userId);
       let assistantState = appendAssistantTurn(getAssistantState(settings), 'CAREGIVER', rawCommand, {
-        appointmentId: normalizeOptionalUuid(requestedAppointmentId),
+        appointmentId: normalizedRequestedAppointmentId,
       });
+      const effectiveRequestedAppointmentId =
+        normalizedRequestedAppointmentId ||
+        normalizeOptionalUuid(assistantState.pending?.requestedAppointmentId) ||
+        normalizeOptionalUuid(assistantState.memory?.appointmentId);
       const commandTurn = assistantState.history[assistantState.history.length - 1];
       if (commandTurn) {
         try {
           await appendAgentDeskMessage({
             caregiverId: userId,
             actorType: 'CAREGIVER',
-            appointmentId: commandTurn.appointmentId || normalizeOptionalUuid(requestedAppointmentId),
+            appointmentId: commandTurn.appointmentId || effectiveRequestedAppointmentId,
             content: commandTurn.content,
             source: 'AGENT_COMMAND',
             metadata: {
@@ -5116,6 +7133,9 @@ Return:
         assistantState.pending && (shouldMergePending || turnSignals.executePending)
           ? pendingExecutionCommand
           : commandForPlanning;
+      if (shouldMergePending) {
+        assistantState = pushPendingClarification(assistantState, rawCommand);
+      }
       const dateHintFromCommand = parseBusinessDateHint(rawCommand);
       if (dateHintFromCommand) {
         assistantState = {
@@ -5135,16 +7155,29 @@ Return:
         startedAtMs: scheduleAllStartMs,
         ok: true,
       });
+      const referencedClientForTurn = resolveClientReferenceFromContext({
+        command: rawCommand,
+        appointments,
+        requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
+        memory: assistantState.memory,
+      });
+      if (referencedClientForTurn) {
+        assistantState = updateAssistantMemoryFromAppointment(
+          assistantState,
+          referencedClientForTurn,
+          assistantState.memory?.businessDateHint,
+        );
+      }
       const llmContextResolution = await resolveAppointmentWithLLM({
         appointments,
         command: rawCommand,
-        requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+        requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
         memory: assistantState.memory,
       });
       const deterministicExplicitContextForTurn = hasExplicitAppointmentContext({
         command: rawCommand,
         appointments,
-        requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+        requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
       });
       const explicitContextForTurn =
         llmContextResolution?.explicitContext ??
@@ -5169,7 +7202,7 @@ Return:
             command: commandForPlanning,
             assistantState,
             appointments,
-            requestedAppointmentId: requestedAppointmentId || undefined,
+            requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
           });
           recordToolTrace(toolTrace, {
             tool: 'assistant.plan_decision',
@@ -5194,6 +7227,8 @@ Return:
           command: commandForPlanning,
           turnSignals,
           assistantState,
+          appointments,
+          requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
         });
         if (plannerDecision) {
           recordToolTrace(toolTrace, {
@@ -5211,6 +7246,8 @@ Return:
           command: commandForPlanning,
           turnSignals,
           assistantState,
+          appointments,
+          requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
         });
         if (deterministicFallback) {
           plannerDecision = deterministicFallback;
@@ -5241,7 +7278,7 @@ Return:
         const llmResolved = await resolveAppointmentWithLLM({
           appointments,
           command: commandForResolution,
-          requestedAppointmentId: requestedAppointmentId || undefined,
+          requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
           memory: assistantState.memory,
         });
         const target =
@@ -5251,7 +7288,7 @@ Return:
             : pickAppointmentForConversation({
                 appointments,
                 command: commandForResolution,
-                requestedAppointmentId: requestedAppointmentId || undefined,
+                requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
                 memory: assistantState.memory,
               }));
         recordToolTrace(toolTrace, {
@@ -5285,7 +7322,7 @@ Return:
           command: commandForPlanning,
           assistantState,
           appointments,
-          requestedAppointmentId: requestedAppointmentId || undefined,
+          requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
         });
         recordToolTrace(toolTrace, {
           tool: 'assistant.recover_tool_decision',
@@ -5342,6 +7379,30 @@ Return:
         });
       }
 
+      const shouldForceClientInfo =
+        plannerDecision.action === 'RESPOND' &&
+        !turnSignals.isCancellation &&
+        shouldForceClientInfoFromContext({
+          command: commandForPlanning,
+          assistantState,
+          appointments,
+          requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
+        });
+      if (shouldForceClientInfo) {
+        plannerDecision = {
+          action: 'USE_TOOL',
+          tool: 'CLIENT_INFO',
+          infoQuestion: String(commandForPlanning || rawCommand).trim(),
+        };
+        recordToolTrace(toolTrace, {
+          tool: 'assistant.client_info_safety_override',
+          source: 'deterministic_safety',
+          startedAtMs: Date.now(),
+          ok: true,
+          message: 'Forced CLIENT_INFO for client fact query with resolvable client context.',
+        });
+      }
+
       const requiresDelegationContactConfirmation =
         plannerDecision.action === 'USE_TOOL' &&
         plannerDecision.tool === 'START_DELEGATION' &&
@@ -5357,8 +7418,7 @@ Return:
           kind: 'DELEGATION_CONTACT_CONFIRM',
           tool: 'START_DELEGATION',
           baseCommand: commandForToolExecution,
-          requestedAppointmentId:
-            requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+          requestedAppointmentId: effectiveRequestedAppointmentId,
         });
         assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', confirmationPrompt);
         await persistAssistantState();
@@ -5452,7 +7512,7 @@ Return:
             assistantState,
             appointments,
             settings,
-            appointmentIdHint: requestedAppointmentId || assistantState.memory?.appointmentId,
+            appointmentIdHint: effectiveRequestedAppointmentId || assistantState.memory?.appointmentId,
           });
           assistantState = clearAssistantPending(assistantState);
           assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', responseText);
@@ -5472,14 +7532,14 @@ Return:
             kind: 'MAPS_HOME_ADDRESS',
             tool: 'MAPS_ROUTE',
             baseCommand: pendingBase,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
         } else if (followUpTool === 'CLIENT_INFO' || assistantState.pending?.kind === 'CLIENT_INFO_CONTEXT') {
           assistantState = setAssistantPending(assistantState, {
             kind: 'CLIENT_INFO_CONTEXT',
             tool: 'CLIENT_INFO',
             baseCommand: pendingBase,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
         } else if (
           followUpTool === 'START_DELEGATION' ||
@@ -5493,7 +7553,7 @@ Return:
                 : 'DELEGATION_CONTEXT',
             tool: 'START_DELEGATION',
             baseCommand: pendingBase,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
         }
 
@@ -5541,7 +7601,7 @@ Return:
           assistantState,
           appointments,
           settings,
-          appointmentIdHint: requestedAppointmentId || assistantState.memory?.appointmentId,
+          appointmentIdHint: effectiveRequestedAppointmentId || assistantState.memory?.appointmentId,
         });
         const missingInfoPolicyStartMs = Date.now();
         const missingInfoDecision = await evaluateMissingInfoPolicy({
@@ -5558,7 +7618,7 @@ Return:
         });
         const hasActiveDelegationForResponseContext = hasRelevantActiveDelegation({
           settings,
-          appointmentId: requestedAppointmentId || assistantState.memory?.appointmentId,
+          appointmentId: effectiveRequestedAppointmentId || assistantState.memory?.appointmentId,
         });
         const shouldAskDelegationConfirmation =
           missingInfoDecision.action === 'ACQUIRE_MISSING_INFO' &&
@@ -5572,8 +7632,7 @@ Return:
             kind: 'DELEGATION_CONTACT_CONFIRM',
             tool: 'START_DELEGATION',
             baseCommand: commandForToolExecution,
-            requestedAppointmentId:
-              requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
           assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', confirmationPrompt);
           await persistAssistantState();
@@ -5638,7 +7697,7 @@ Return:
             userId,
             command: baseCommand,
             businessDate,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId || undefined,
+            requestedAppointmentId: effectiveRequestedAppointmentId || undefined,
             homeAddressOverride:
               plannerDecision.homeAddress || String(req.body.homeAddress || '').trim(),
           });
@@ -5654,7 +7713,7 @@ Return:
               kind: 'MAPS_HOME_ADDRESS',
               tool: 'MAPS_ROUTE',
               baseCommand,
-              requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+              requestedAppointmentId: effectiveRequestedAppointmentId,
             });
             assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', plan.response);
             await persistAssistantState();
@@ -5727,7 +7786,7 @@ Return:
             kind: 'CLIENT_INFO_CONTEXT',
             tool: 'CLIENT_INFO',
             baseCommand: infoQuestion,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
           assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', followUp);
           await persistAssistantState();
@@ -5758,7 +7817,7 @@ Return:
           messageLimit: messageSearchLimit,
           snippetLimit: responseSnippetLimit,
           targetBusinessDate: businessDateHint || undefined,
-          specificAppointmentId: requestedAppointmentId || undefined,
+          specificAppointmentId: effectiveRequestedAppointmentId || undefined,
         });
         recordToolTrace(toolTrace, {
           tool: 'chat.lookup_client_info',
@@ -5878,7 +7937,7 @@ Return:
             kind: 'DELEGATION_TARGET_CONTEXT',
             tool: 'START_DELEGATION',
             baseCommand: delegationCommand,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
           assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', followUp);
           await persistAssistantState();
@@ -5899,7 +7958,7 @@ Return:
             kind: 'DELEGATION_TARGET_CONTEXT',
             tool: 'START_DELEGATION',
             baseCommand: delegationCommand,
-            requestedAppointmentId: requestedAppointmentId || assistantState.pending?.requestedAppointmentId,
+            requestedAppointmentId: effectiveRequestedAppointmentId,
           });
           assistantState = appendAssistantTurn(assistantState, 'ASSISTANT', followUp);
           await persistAssistantState();
@@ -6040,11 +8099,29 @@ Return:
             : startResult.firstQuestion
               ? `First question sent: ${startResult.firstQuestion}`
               : 'A kickoff update was sent to the client.';
-        const responseText = [
-          `Started delegation for ${targetAppointment.clientName}.`,
-          `Window: ${formatBusinessDateTime(startResult.delegation.startedAt)} to ${formatBusinessDateTime(startResult.delegation.endsAt)}.`,
-          kickoffQuestionLine,
-        ].join(' ');
+        const appendedQuestionCount = Number(startResult.appendedQuestionCount || 0);
+        const newlyAskedQuestions = Array.isArray(startResult.newlyAskedQuestions)
+          ? startResult.newlyAskedQuestions.filter(Boolean)
+          : [];
+        const responseText = startResult.reusedExisting
+          ? appendedQuestionCount > 0
+            ? [
+                `Added ${appendedQuestionCount} follow-up question${appendedQuestionCount === 1 ? '' : 's'} to the active delegation for ${targetAppointment.clientName}.`,
+                `Current window: ${formatBusinessDateTime(startResult.delegation.startedAt)} to ${formatBusinessDateTime(startResult.delegation.endsAt)}.`,
+                newlyAskedQuestions.length > 0
+                  ? `Asked now: ${newlyAskedQuestions.join(' | ')}`
+                  : 'New questions were added and will continue within this same delegation window.',
+              ].join(' ')
+            : [
+                `Delegation is already active for ${targetAppointment.clientName}.`,
+                `Current window: ${formatBusinessDateTime(startResult.delegation.startedAt)} to ${formatBusinessDateTime(startResult.delegation.endsAt)}.`,
+                'No new unique questions were added.',
+              ].join(' ')
+          : [
+              `Started delegation for ${targetAppointment.clientName}.`,
+              `Window: ${formatBusinessDateTime(startResult.delegation.startedAt)} to ${formatBusinessDateTime(startResult.delegation.endsAt)}.`,
+              kickoffQuestionLine,
+            ].join(' ');
         const disclosedResponseText = appendInferredContextDisclosure(responseText, {
           inferred: !explicitContextForTurn,
           appointment: targetAppointment,
@@ -6105,6 +8182,7 @@ Return:
       }
 
       const endedAt = new Date().toISOString();
+      const wasSystemManagedPrecheck = isSystemManagedDelegationEntry(delegation);
       const summary = await buildDelegationSummary(appointmentId, delegation.startedAt, endedAt, {
         objective: delegation.objective,
         questions: delegation.questions || [],
@@ -6132,6 +8210,23 @@ Return:
         },
       ]);
       await saveAgentSettings(userId, role || 'CAREGIVER', settings);
+
+      if (!wasSystemManagedPrecheck) {
+        try {
+          await maybeResumePrecheckAfterManualCompletion({
+            appointmentId,
+            caregiverId: userId,
+            manualDelegationStartedAt: delegation.startedAt,
+            manualDelegationEndedAt: endedAt,
+          });
+        } catch (error) {
+          console.error('Failed to evaluate post-manual precheck recovery', {
+            appointmentId,
+            caregiverId: userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
 
       res.json({ success: true, data: updated });
     } catch (error) {

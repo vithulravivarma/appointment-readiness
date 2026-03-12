@@ -15,6 +15,10 @@ Appointment readiness + caregiver delegation system with:
 
 Routing/intent flow details:
 - `docs/agent-routing-architecture.md`
+- WhatsApp production operations:
+  - `docs/whatsapp-production-runbook.md`
+- Handoff cleanup checklist:
+  - `docs/handoff-cleanup-plan.md`
 
 ### Precheck Profiles (Swappable Components)
 - Profile definitions live in `shared/types/src/precheck.ts`.
@@ -43,7 +47,11 @@ SQS_ENDPOINT=http://localhost:4566
 OPENAI_API_KEY=...
 GOOGLE_MAPS_API_KEY=...
 WHATSAPP_ENABLED=true
-WHATSAPP_TRIAL_MODE=true
+WHATSAPP_TRIAL_MODE=false
+WHATSAPP_MAX_INBOUND_CHARS=2000
+WHATSAPP_RATE_LIMIT_PER_ENDPOINT=30
+WHATSAPP_STATUS_RETENTION_DAYS=30
+WHATSAPP_REDACT_LOGS=true
 TWILIO_ACCOUNT_SID=...
 TWILIO_API_KEY_SID=...
 TWILIO_API_KEY_SECRET=...
@@ -135,6 +143,29 @@ curl http://localhost:3001/testing/channel-endpoints
 Notes:
 - Trial mode allowlist enforcement applies to inbound and outbound WhatsApp numbers.
 - Media messages are ignored in demo mode (text-only).
+- Delegation/precheck kickoff now fan out to app + WhatsApp when `WHATSAPP_ENABLED=true` and a verified active WhatsApp endpoint mapping exists.
+- If WhatsApp is disabled or no verified endpoint exists, core app behavior is unchanged (app-only kickoff remains).
+
+## Twilio WhatsApp Production Ops
+
+1) Recover retryable inbound processing failures:
+```bash
+npm run whatsapp:replay-failed -- 100
+```
+
+2) Prune old webhook ledger rows:
+```bash
+npm run whatsapp:prune-events -- 30
+```
+
+3) Optional API-based operations:
+- Replay failed inbound events: `POST /testing/whatsapp/replay-failed-inbound`
+- Prune webhook events: `POST /testing/whatsapp/prune-webhook-events`
+
+4) Recommended production webhook flags:
+- `WHATSAPP_ENABLED=true`
+- `WHATSAPP_TRIAL_MODE=false`
+- Keep `WHATSAPP_ALLOWLIST_NUMBERS` empty by default; set it only as an emergency circuit-breaker.
 
 ## Data Ingestion
 
@@ -258,17 +289,16 @@ curl -X POST http://localhost:3001/messages \
 curl http://localhost:3001/appointments/<appointment-uuid>/readiness
 ```
 
-### 3) Start delegated AI handoff
+### 3) Start delegated AI handoff (via command desk)
 ```bash
-curl -X POST http://localhost:3001/agents/<caregiver-user-id>/delegations/start \
+curl -X POST http://localhost:3001/agents/<caregiver-user-id>/command \
   -H "Content-Type: application/json" \
   -d '{
     "appointmentId":"<appointment-uuid>",
-    "objective":"Keep family updated and collect blockers.",
-    "durationMinutes":30,
-    "questions":["Any access issues?","Are medications/supplies ready?"]
+    "command":"Please contact family and confirm access plus meds/supplies readiness."
   }'
 ```
+If the assistant returns a confirmation prompt, send a second command like `yes` to proceed.
 
 ### 4) Free-form command desk action (auto-answer or auto-start delegation)
 ```bash
@@ -284,7 +314,7 @@ This endpoint can:
 - answer route and drive-time questions using Google Maps (home-to-visit, visit-to-home, and between visits),
 - search recent conversation history for that client across appointments (with scan limits),
 - look up access-code evidence from conversation history,
-- auto-start a delegation window using the same safeguards as manual `/delegations/start`.
+- start a delegation window after confirmation in the same chat flow.
 Optional tuning: include `searchLimits` in request body, e.g. `{"searchLimits":{"appointmentLimit":6,"messageLimit":180,"snippetLimit":4}}`.
 Optional maps override: include `homeAddress` in the request body when caregiver home address is not stored.
 
